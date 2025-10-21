@@ -1,879 +1,1248 @@
-/*
- * Full Liquidity/Pool Creation Tracker
- *
- * This script listens for Solana on-chain events that hint at new liquidity being added
- * or pools being created on decentralized exchanges. It uses Helius WebSockets for
- * real‑time updates, HTTP RPC calls for verification, and optionally the Solscan Pro API
- * for additional metadata. Detected tokens/pools are stored in an SQLite DB and a
- * notification is sent via Telegram. Configuration is via environment variables.
- *
- * Features:
- *  - Configurable subscription modes: logsSubscribe (mentions), programSubscribe,
- *    or logsSubscribe all (firehose).
- *  - Configurable commitments per WebSocket and HTTP RPC requests.
- *  - Rate limiter and circuit breaker to handle RPC 429s gracefully.
- *  - Concurrency limited verification queue and fallback inspector for program
- *    notifications without signatures.
- *  - Optional Solscan API integration for chain information and token metadata.
- *  - Automatic token filtering by monitored program IDs or owner whitelist.
- *  - Time filters to notify only for today or within a maximum age window.
- *  - Express dashboard to view detected tokens/pools in real time.
- *
- * To use:
- *   1. Ensure Node.js (v18+), npm, and Python build tools are installed.
- *   2. Copy this file to your project root (e.g. helius-liquidity-bot).
- *   3. Create .env (see README) with BOT_TOKEN, CHAT_ID, HELIUS_API_KEY, etc.
- *   4. Run `npm install` to install dependencies.
- *   5. Start with `node full-liquidity-tracker.js`.
- */
+import "dotenv/config";
+import pino from "pino";
+import fs from "fs";
+import path from "path";
+import express from "express";
+import TelegramBot from "node-telegram-bot-api";
+import { Connection, PublicKey, Connection as SolConn } from "@solana/web3.js";
+import { logEvent } from "./db.js";  // NEW: SQLite logging module
 
-const fs = require('fs');
-const path = require('path');
-const WebSocket = require('ws');
-const axios = require('axios');
-const express = require('express');
-const sqlite3 = require('sqlite3');
-const { open } = require('sqlite');
-require('dotenv').config();
+const log = pino({ level: process.env.DEBUG === "true" ? "debug" : "info" });
 
-/* =====================================
- * Configuration from .env
- * ===================================*/
-const BOT_TOKEN = process.env.BOT_TOKEN || '';
-const CHAT_ID = process.env.CHAT_ID || '';
-// Helius API key and optional RPC override
-const HELIUS_API_KEY = process.env.HELIUS_API_KEY || '';
-const RPC_URL = process.env.RPC_URL || (HELIUS_API_KEY
-  ? `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`
-  : '');
-const RPC_ALT_URLS = (process.env.RPC_ALT_URLS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
-// Optional Solscan Pro API key for metadata
-const SOLSCAN_API_KEY = process.env.SOLSCAN_API_KEY || '';
-// HTTP RPC commitment, defaults to WS commitment if not set
-const WS_COMMITMENT = process.env.WS_COMMITMENT || 'processed';
-const RPC_COMMITMENT = process.env.RPC_COMMITMENT || WS_COMMITMENT;
-// WebSocket subscription modes
-const USE_LOGS_MENTIONS = (process.env.USE_LOGS_MENTIONS || 'true') === 'true';
-const USE_PROGRAM_SUBSCRIBE = (process.env.USE_PROGRAM_SUBSCRIBE || 'false') === 'true';
-const USE_LOGS_ALL = (process.env.USE_LOGS_ALL || 'false') === 'true';
-// Behavior flags and timing
-const DELAY_SECONDS = Number(process.env.DELAY_SECONDS || 0) * 1000;
-const PORT = Number(process.env.PORT || 3000);
-const USER_TZ = process.env.USER_TZ || 'UTC';
-const ONLY_TODAY = (process.env.ONLY_TODAY || 'false') === 'true';
-const MAX_AGE_SECONDS = Number(process.env.MAX_AGE_SECONDS || 0);
-const VERIFY_MINT_BEFORE_NOTIFY = (process.env.VERIFY_MINT_BEFORE_NOTIFY || 'true') === 'true';
-// Concurrency and retry
-const VERIFY_CONCURRENCY = Number(process.env.VERIFY_CONCURRENCY || 5);
-const VERIFY_RETRIES = Number(process.env.VERIFY_RETRIES || 3);
-const VERIFY_BASE_DELAY_MS = Number(process.env.VERIFY_BASE_DELAY_MS || 400);
-const FALLBACK_SIGNATURE_LIMIT = Number(process.env.FALLBACK_SIGNATURE_LIMIT || 5);
-const FALLBACK_CONCURRENCY = Number(process.env.FALLBACK_CONCURRENCY || 2);
-const INSPECT_TTL_MS = Number(process.env.FALLBACK_INSPECT_TTL_MS || 60000);
-// Rate limiter & circuit breaker parameters
-const RATE_LIMIT_RPS = Number(process.env.RATE_LIMIT_RPS || 6);
-const RATE_LIMIT_BURST = Number(process.env.RATE_LIMIT_BURST || 12);
-const RATE_LIMIT_REFILL_MS = Number(process.env.RATE_LIMIT_REFILL_MS || 250);
-const RATE_LIMIT_MAX_BACKOFF_MS = Number(process.env.RATE_LIMIT_MAX_BACKOFF_MS || 15000);
-const CIRCUIT_429_THRESHOLD = Number(process.env.CIRCUIT_429_THRESHOLD || 6);
-const CIRCUIT_WINDOW_MS = Number(process.env.CIRCUIT_WINDOW_MS || 10000);
-const CIRCUIT_OPEN_MS = Number(process.env.CIRCUIT_OPEN_MS || 20000);
-// Owner whitelist (if provided) or derived from programs
-let OWNER_WHITELIST = (process.env.OWNER_WHITELIST || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
-// Liquidity markers, with optional extras
-const EXTRA_MARKERS = (process.env.EXTRA_MARKERS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
-// Debug flag
-const DEBUG = (process.env.DEBUG || 'false') === 'true';
+// =========================
+// PLAN PROFILES (FREE vs PAID)
+// =========================
+const PLAN = String(process.env.PLAN_TIER || "free").toLowerCase();
 
-/* =====================================
- * Helper functions
- * ===================================*/
-function sleep(ms) {
-  return new Promise(res => setTimeout(res, ms));
-}
-function jitter(ms) {
-  const delta = Math.floor(ms * 0.25);
-  return ms + (Math.random() * 2 * delta - delta);
-}
-function debugLog(...args) {
-  if (DEBUG) console.debug(new Date().toISOString(), '[DEBUG]', ...args);
-}
-function log(...args) {
-  console.log(new Date().toISOString(), ...args);
-}
-function warn(...args) {
-  console.warn(new Date().toISOString(), '[WARN]', ...args);
-}
-function errLog(...args) {
-  console.error(new Date().toISOString(), '[ERROR]', ...args);
-}
-function isB58(str) {
-  return typeof str === 'string' && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(str);
-}
-function isBase58OrSystem(str) {
-  if (str === '11111111111111111111111111111111') return true;
-  return isB58(str);
+// Defaults per plan (can be overridden in .env)
+if (PLAN === "free") {
+  process.env.CONCURRENCY ||= "1";
+  process.env.RATE_LIMIT_RPS ||= "1";          // target: ≥1 req/s
+  process.env.RATE_LIMIT_REFILL_MS ||= "1000";
+  process.env.AFTER_HTTP_MS ||= "0";
+  process.env.CIRCUIT_429_THRESHOLD ||= "2";
+  process.env.CIRCUIT_OPEN_MS ||= "15000";     // 15s
+  process.env.ONLY_TODAY ||= "true";
+  process.env.ONLY_TODAY_LOOKUP ||= "true";    // lookup expensive; ON by default for today-only tokens
+  process.env.WS_COMMITMENT ||= "processed";
+  process.env.RPC_COMMITMENT ||= "confirmed";
+  process.env.COMMITMENT ||= "confirmed";
+  process.env.PID_CAP ||= "1";                 // 1 PID on free (reduce 429s)
+} else {
+  // paid / dev / business (Atlas configurable via .env)
+  process.env.CONCURRENCY ||= "3";
+  process.env.RATE_LIMIT_RPS ||= "8";          // higher throughput on paid plan
+  process.env.RATE_LIMIT_REFILL_MS ||= "1000";
+  process.env.AFTER_HTTP_MS ||= "0";
+  process.env.CIRCUIT_429_THRESHOLD ||= "6";
+  process.env.CIRCUIT_OPEN_MS ||= "10000";
+  process.env.ONLY_TODAY ||= "true";
+  process.env.ONLY_TODAY_LOOKUP ||= "true";    // ensure token creation date lookup by default
+  process.env.WS_COMMITMENT ||= "processed";
+  process.env.RPC_COMMITMENT ||= "confirmed";
+  process.env.COMMITMENT ||= "confirmed";
+  process.env.PID_CAP ||= "999";
 }
 
-/* =====================================
- * Rate limiter & circuit breaker
- * ===================================*/
-let bucketTokens = RATE_LIMIT_BURST;
-let lastRefill = Date.now();
-let recent429 = [];
-let circuitOpenUntil = 0;
+// =========================
+// Utils
+// =========================
+function envBool(name, def = false) {
+  const v = process.env[name];
+  if (v == null) return def;
+  return ["1", "true", "yes", "on"].includes(String(v).toLowerCase());
+}
+function envInt(name, def = 0) {
+  const v = process.env[name];
+  return v == null ? def : parseInt(v, 10);
+}
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-function refillBucket() {
-  const now = Date.now();
-  const elapsed = now - lastRefill;
-  if (elapsed >= RATE_LIMIT_REFILL_MS) {
-    const add = Math.floor((elapsed / 1000) * RATE_LIMIT_RPS);
-    bucketTokens = Math.min(RATE_LIMIT_BURST, bucketTokens + add);
-    lastRefill = now;
-  }
+function safePkStr(x) {
+  try { return new PublicKey(x).toBase58(); } catch { return null; }
 }
-async function acquireRpcToken() {
-  for (;;) {
-    refillBucket();
-    if (bucketTokens > 0) {
-      bucketTokens--;
-      return;
-    }
-    await sleep(50);
-  }
-}
-function mark429() {
-  const now = Date.now();
-  recent429.push(now);
-  recent429 = recent429.filter(t => now - t <= CIRCUIT_WINDOW_MS);
-  if (recent429.length >= CIRCUIT_429_THRESHOLD) {
-    circuitOpenUntil = now + CIRCUIT_OPEN_MS;
-    recent429 = [];
-    debugLog('Circuit breaker: OPEN (throttle mode) for', CIRCUIT_OPEN_MS, 'ms');
-  }
-}
-function isCircuitOpen() {
-  return Date.now() < circuitOpenUntil;
-}
-function currentThrottleDelay(base) {
-  if (!isCircuitOpen()) return base;
-  return Math.min(RATE_LIMIT_MAX_BACKOFF_MS, base * 2 + 500);
+function getKeyPubkey(k) {
+  return k?.pubkey || k || null;
 }
 
-/* =====================================
- * Programs file & effective whitelist
- * ===================================*/
-const programsFile = path.join(__dirname, 'programs.json');
-let PROGRAMS = [];
-let PROGRAM_IDS = [];
-let EFFECTIVE_WHITELIST = [];
+// =========================
+// Subscription modes & PID control
+// =========================
+// SUB_MODE: program_logs | logs_all | program_subscribe
+const SUB_MODE = String(process.env.SUB_MODE || "program_logs").toLowerCase();
 
-function computeEffectiveWhitelist() {
-  if (Array.isArray(OWNER_WHITELIST) && OWNER_WHITELIST.length > 0) {
-    EFFECTIVE_WHITELIST = OWNER_WHITELIST.filter(Boolean);
-  } else {
-    const base = new Set(PROGRAM_IDS.filter(Boolean));
-    base.add('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
-    EFFECTIVE_WHITELIST = Array.from(base);
-  }
-  debugLog('Computed effective whitelist: ', EFFECTIVE_WHITELIST);
-}
-function loadPrograms() {
-  PROGRAMS = [];
-  PROGRAM_IDS = [];
-  try {
-    if (fs.existsSync(programsFile)) {
-      const raw = fs.readFileSync(programsFile, 'utf8');
-      const parsed = JSON.parse(raw);
-      const arr = Array.isArray(parsed.programs) ? parsed.programs : [];
-      PROGRAMS = arr.filter(p => p && p.id && isBase58OrSystem(p.id));
-      PROGRAM_IDS = PROGRAMS.map(p => p.id).filter(Boolean);
-      log(`Loaded ${PROGRAMS.length} program entries from programs.json`);
-    } else {
-      warn('programs.json not found — no program filtering will apply');
-    }
-  } catch (e) {
-    errLog('Failed to parse programs.json:', e);
-  }
-  computeEffectiveWhitelist();
-}
-loadPrograms();
-// Watch programs.json for changes
-try {
-  fs.watchFile(programsFile, { interval: 2000 }, (curr, prev) => {
-    if (curr.mtimeMs !== prev.mtimeMs) {
-      log('programs.json changed — reloading');
-      loadPrograms();
-    }
-  });
-} catch {
-  // ignore watchers on unsupported platforms
-}
+// PROGRAM_LOGS_MODE: off | only | first
+// - only: use ONLY the "programLogs"/"logs" list from programs.json (in order)
+// - first: prioritize the "programLogs" list, then fill with meteora+extra
+// - off: old behavior (meteora + extra)
+const PROGRAM_LOGS_MODE = String(process.env.PROGRAM_LOGS_MODE || "off").toLowerCase();
 
-/* =====================================
- * SQLite database
- * ===================================*/
-const DB_FILE = path.join(__dirname, 'tokens.db');
-const dbPromise = open({ filename: DB_FILE, driver: sqlite3.Database });
-(async () => {
-  const db = await dbPromise;
-  await db.exec(`CREATE TABLE IF NOT EXISTS tokens (
-    token_address TEXT PRIMARY KEY,
-    first_seen INTEGER,
-    liquidity_tx TEXT,
-    program_id TEXT,
-    notified INTEGER DEFAULT 0,
-    verified INTEGER DEFAULT 0,
-    metadata TEXT
-  );`);
-  await db.exec(`CREATE TABLE IF NOT EXISTS verified_mints (
-    token_address TEXT PRIMARY KEY,
-    verified_at INTEGER
-  );`);
-})();
-
-/* =====================================
- * State & Queues
- * ===================================*/
-const dumpedTxs = new Set();
-const verifiedCache = new Map();
-const verifyQueue = [];
-let activeVerifications = 0;
-const notifyQueue = [];
-let notifyProcessing = false;
-const inspectingPubkeys = new Map();
-let activeInspectors = 0;
-const inspectQueue = [];
-
-// Liquidity markers
-const baseMarkers = [/mint/i, /addliquidity/i, /create/i, /deposit/i, /pool/i, /swap/i, /initialize/i];
-const extraRegex = EXTRA_MARKERS.map(m => {
-  try { return new RegExp(m, 'i'); } catch { return null; }
-}).filter(Boolean);
-const liquidityMarkers = baseMarkers.concat(extraRegex);
-
-/* =====================================
- * Telegram sending
- * ===================================*/
-async function sendTelegram(text) {
-  if (!BOT_TOKEN || !CHAT_ID) {
-    warn('Telegram BOT_TOKEN or CHAT_ID not set; skipping message');
-    return null;
-  }
-  try {
-    const res = await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-      chat_id: CHAT_ID,
-      text,
-      parse_mode: 'HTML',
-      disable_web_page_preview: true
-    }, { timeout: 15000 });
-    debugLog('Telegram response', res.data);
-    return res.data;
-  } catch (e) {
-    errLog('Telegram send error', e?.response?.data || e?.message || e);
-    return null;
-  }
+// current target PIDs (for gating in logs_all/webhook modes)
+let __TARGET_PIDS_SET = new Set();
+function setTargetPids(pids) {
+  __TARGET_PIDS_SET = new Set((pids || []).map(String));
 }
-
-/* =====================================
- * DB helpers
- * ===================================*/
-async function insertTokenRow(token, txSig, pid, verified = 0, metadata = null) {
-  const db = await dbPromise;
-  try {
-    await db.run(
-      'INSERT OR IGNORE INTO tokens (token_address, first_seen, liquidity_tx, program_id, verified, metadata) VALUES (?, ?, ?, ?, ?, ?)',
-      [token, Math.floor(Date.now() / 1000), txSig || null, pid || null, verified ? 1 : 0, metadata ? JSON.stringify(metadata) : null]
-    );
-  } catch (e) {
-    errLog('insertTokenRow error', e?.message || e);
-  }
-}
-async function markTokenNotified(token) {
-  const db = await dbPromise;
-  await db.run('UPDATE tokens SET notified=1 WHERE token_address=?', [token]);
-}
-async function markTokenVerified(token, metadata) {
-  const db = await dbPromise;
-  await db.run('UPDATE tokens SET verified=1, metadata=? WHERE token_address=?', [metadata ? JSON.stringify(metadata) : null, token]);
-  await db.run('INSERT OR REPLACE INTO verified_mints (token_address, verified_at) VALUES (?, ?)', [token, Math.floor(Date.now() / 1000)]);
-}
-async function isTokenNotified(token) {
-  const db = await dbPromise;
-  const r = await db.get('SELECT notified FROM tokens WHERE token_address=?', [token]);
-  return !!(r && r.notified);
-}
-async function isTokenVerifiedInDB(token) {
-  const db = await dbPromise;
-  const r = await db.get('SELECT verified FROM tokens WHERE token_address=?', [token]);
-  if (r && r.verified) return true;
-  const v = await db.get('SELECT verified_at FROM verified_mints WHERE token_address=?', [token]).catch(() => null);
-  return !!v;
-}
-
-/* =====================================
- * Concurrency helpers
- * ===================================*/
-function scheduleVerify(fn) {
-  return new Promise((resolve, reject) => {
-    verifyQueue.push({ fn, resolve, reject });
-    processVerifyQueue();
-  });
-}
-async function processVerifyQueue() {
-  const cap = isCircuitOpen() ? Math.max(1, Math.floor(VERIFY_CONCURRENCY / 2)) : VERIFY_CONCURRENCY;
-  if (activeVerifications >= cap) return;
-  const job = verifyQueue.shift();
-  if (!job) return;
-  activeVerifications++;
-  try {
-    const r = await job.fn();
-    job.resolve(r);
-  } catch (e) {
-    job.reject(e);
-  } finally {
-    activeVerifications--;
-    setImmediate(processVerifyQueue);
-  }
-}
-function acquireInspectSlot() {
-  return new Promise(resolve => {
-    const cap = isCircuitOpen() ? Math.max(1, Math.floor(FALLBACK_CONCURRENCY / 2)) : FALLBACK_CONCURRENCY;
-    if (activeInspectors < cap) {
-      activeInspectors++;
-      return resolve();
-    }
-    inspectQueue.push(resolve);
-  });
-}
-function releaseInspectSlot() {
-  activeInspectors = Math.max(0, activeInspectors - 1);
-  const next = inspectQueue.shift();
-  if (next) {
-    activeInspectors++;
-    next();
-  }
-}
-
-/* =====================================
- * RPC helpers with retries & backoff
- * ===================================*/
-async function httpPostWithRetry(url, body, retries = VERIFY_RETRIES) {
-  let attempt = 0;
-  let lastErr = null;
-  const roster = [url, ...RPC_ALT_URLS];
-  let endpointIdx = 0;
-  while (attempt <= retries) {
-    if (typeof acquireRpcToken === 'function') await acquireRpcToken();
-    if (isCircuitOpen()) await sleep(currentThrottleDelay(0));
-    const endpoint = roster[endpointIdx % roster.length];
-    try {
-      const res = await axios.post(endpoint, body, { timeout: 15000, headers: { 'content-type': 'application/json' } });
-      return res.data;
-    } catch (e) {
-      lastErr = e;
-      const status = e?.response?.status;
-      if (status === 429) mark429();
-      const isNet = !status;
-      if (status === 429 || isNet || status >= 500) endpointIdx++;
-      attempt++;
-      const baseDelay = VERIFY_BASE_DELAY_MS * Math.pow(2, attempt - 1);
-      const wait = currentThrottleDelay(baseDelay);
-      errLog('RPC error', status ? `HTTP ${status}` : (e?.message || e), 'attempt', attempt, 'waiting', wait);
-      await sleep(jitter(wait));
+function logsContainAnyPid(logMsgs = [], pidSet = __TARGET_PIDS_SET) {
+  if (!pidSet || pidSet.size === 0) return true;  // no target => allow all
+  for (const line of logMsgs || []) {
+    for (const pid of pidSet) {
+      if (line.includes(pid)) return true;
     }
   }
-  throw lastErr;
+  return false;
+}
+function txLikeTouchesAnyPid(txLike, pidSet = __TARGET_PIDS_SET) {
+  if (!pidSet || pidSet.size === 0) return true;
+  const keys = txLike?.transaction?.message?.accountKeys || [];
+  for (const k of keys) {
+    const pk = getKeyPubkey(k);
+    if (pk && pidSet.has(pk)) return true;
+  }
+  const logs = txLike?.meta?.logMessages || txLike?.logs || [];
+  return logsContainAnyPid(logs, pidSet);
 }
 
-/* =====================================
- * Solscan API helpers (optional)
- * ===================================*/
-async function solscanGetChainInfo() {
-  if (!SOLSCAN_API_KEY) return null;
-  try {
-    const res = await axios.get('https://pro-api.solscan.io/v2.0/chaininfo', {
-      headers: { token: SOLSCAN_API_KEY },
-      timeout: 15000
-    });
-    return res.data;
-  } catch (e) {
-    debugLog('Solscan chaininfo error', e?.message || e);
-    return null;
-  }
-}
-async function solscanGetTokenMetadata(mint) {
-  if (!SOLSCAN_API_KEY || !mint) return null;
-  try {
-    const url = `https://pro-api.solscan.io/v2.0/token/meta?tokenAddress=${mint}`;
-    const res = await axios.get(url, { headers: { token: SOLSCAN_API_KEY }, timeout: 15000 });
-    return res.data;
-  } catch (e) {
-    debugLog('Solscan metadata error', e?.message || e);
-    return null;
-  }
+// =========================
+// Known Program IDs (to NEVER confuse with mint addresses)
+// (will be supplemented at runtime with subscribed PIDs)
+// =========================
+let __ALL_PROGRAM_IDS_SET = new Set([
+  "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", // SPL Token Program
+  "11111111111111111111111111111111",            // System Program
+  "ComputeBudget111111111111111111111111111111", // Compute Budget Program
+  "Stake11111111111111111111111111111111111111", // Stake Program
+  "Vote111111111111111111111111111111111111111", // Vote Program
+]);
+
+function isValidMint(mintStr) {
+  const s = safePkStr(mintStr);
+  if (!s) return false;
+  // Do not allow known Program IDs to be misidentified as mints:
+  if (__ALL_PROGRAM_IDS_SET.has(s)) return false;
+  return true;
 }
 
-/* =====================================
- * Verification & metadata
- * ===================================*/
-async function getTransactionParsed(sig) {
-  if (!RPC_URL) return null;
-  try {
-    const body = { jsonrpc: '2.0', id: 1, method: 'getTransaction', params: [sig, { encoding: 'jsonParsed', commitment: RPC_COMMITMENT }] };
-    const data = await httpPostWithRetry(RPC_URL, body);
-    return data?.result || null;
-  } catch (e) {
-    debugLog('getTransactionParsed error', e?.message || e);
-    return null;
-  }
+// ======================================================================
+// DEDUP START — send only once per token (configurable scope)
+// ======================================================================
+const DEDUP_ENABLED = ["1", "true", "yes", "on"].includes(String(process.env.DEDUP_ENABLED ?? "true").toLowerCase());
+const DEDUP_SCOPE = String(process.env.DEDUP_SCOPE || "mint_day").toLowerCase();  // options: mint | mint_day | mint_pool_day | mint_forever
+const DEDUP_TTL_SECONDS = parseInt(process.env.DEDUP_TTL_SECONDS || "86400", 10);
+const DEDUP_FILE = process.env.DEDUP_FILE
+  ? path.resolve(process.cwd(), process.env.DEDUP_FILE)
+  : path.resolve(process.cwd(), "dedup-cache.json");
+
+function startOfUtcDaySec(tsSec) {
+  const d = new Date((tsSec ?? (Date.now() / 1000 | 0)) * 1000);
+  return (Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) / 1000) | 0;
 }
-async function getAccountInfoParsed(addr) {
-  if (!RPC_URL) return null;
-  try {
-    const body = { jsonrpc: '2.0', id: 1, method: 'getAccountInfo', params: [addr, { encoding: 'jsonParsed', commitment: RPC_COMMITMENT }] };
-    const data = await httpPostWithRetry(RPC_URL, body);
-    return data?.result?.value || null;
-  } catch (e) {
-    debugLog('getAccountInfoParsed error', e?.message || e);
-    return null;
+
+class Dedup {
+  constructor() {
+    this.map = new Map(); // key -> expireAtSec (0 => forever)
+    this.dirty = false;
+    this._load();
+    this._startPruner();
+    process.on("SIGINT", () => { try { this._save(true); } finally { process.exit(0); } });
+    process.on("SIGTERM", () => { try { this._save(true); } finally { process.exit(0); } });
   }
-}
-function isTodayInTZ(epochSec, tz) {
-  try {
-    const d = new Date(epochSec * 1000);
-    const now = new Date();
-    const opts = { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' };
-    return d.toLocaleDateString('en-CA', opts) === now.toLocaleDateString('en-CA', opts);
-  } catch {
+  _keyForEvent(ev) {
+    const base = ev?.mints?.base || ev?.mints?.quote;
+    if (!base) return null;
+    const pool = ev?.pool_authority || "-";
+    const day = startOfUtcDaySec(ev?.timestamp || (Date.now() / 1000 | 0));
+    switch (DEDUP_SCOPE) {
+      case "mint":
+      case "mint_forever":
+        return `mint:${base}`;
+      case "mint_pool_day":
+        return `mpd:${base}:${pool}:${day}`;
+      case "mint_day":
+      default:
+        return `md:${base}:${day}`;
+    }
+  }
+  _expiryForEvent(ev) {
+    if (DEDUP_SCOPE === "mint" || DEDUP_SCOPE === "mint_forever") return 0;
+    const baseDay = startOfUtcDaySec(ev?.timestamp || (Date.now() / 1000 | 0));
+    return baseDay + (Number.isFinite(DEDUP_TTL_SECONDS) ? DEDUP_TTL_SECONDS : 86400);
+  }
+  shouldSkip(ev) {
+    if (!DEDUP_ENABLED) return false;
+    const key = this._keyForEvent(ev);
+    if (!key) return false;
+    const now = (Date.now() / 1000) | 0;
+    const exp = this.map.get(key);
+    if (exp == null) return false;
+    if (exp === 0) return true;
+    if (exp > now) return true;
+    // expired
+    this.map.delete(key);
+    this.dirty = true;
     return false;
   }
-}
-function isFreshByAge(epochSec) {
-  if (!MAX_AGE_SECONDS || MAX_AGE_SECONDS <= 0) return true;
-  const age = Math.floor(Date.now() / 1000) - (epochSec || 0);
-  return age >= 0 && age <= MAX_AGE_SECONDS;
-}
-async function verifyMintViaTransaction(sig, candidate) {
-  const tx = await getTransactionParsed(sig);
-  if (!tx) return { ok: false };
-  const blockTime = tx.blockTime || null;
-  if (ONLY_TODAY && blockTime && !isTodayInTZ(blockTime, USER_TZ)) return { ok: false };
-  if (!isFreshByAge(blockTime || Math.floor(Date.now() / 1000))) return { ok: false };
-  const meta = tx.meta || {};
-  const post = meta.postTokenBalances || [];
-  for (const p of post) {
-    if (p && p.mint === candidate) return { ok: true, metadata: { source: 'postTokenBalances', info: p } };
+  markSent(ev) {
+    if (!DEDUP_ENABLED) return;
+    const key = this._keyForEvent(ev);
+    if (!key) return;
+    const exp = this._expiryForEvent(ev);
+    this.map.set(key, exp);
+    this.dirty = true;
+    this._save();
   }
-  const instructions = tx.transaction?.message?.instructions || [];
-  for (const ins of instructions) {
-    const parsed = ins.parsed || {};
-    const info = parsed.info || {};
-    if (info.mint === candidate || info.tokenMint === candidate || info.account === candidate) {
-      return { ok: true, metadata: { source: 'instruction', info: parsed } };
-    }
-  }
-  return { ok: false };
-}
-async function verifyMintViaAccount(addr) {
-  const val = await getAccountInfoParsed(addr);
-  if (!val) return { ok: false };
-  const parsed = val.data?.parsed;
-  if (parsed && parsed.type === 'mint') return { ok: true, metadata: { source: 'account', info: parsed } };
-  return { ok: false };
-}
-async function verifyCandidate(sig, candidate) {
-  if (!candidate) return { ok: false };
-  if (verifiedCache.has(candidate)) return { ok: true, source: 'cache' };
-  if (await isTokenVerifiedInDB(candidate)) {
-    verifiedCache.set(candidate, { verifiedAt: Date.now() });
-    return { ok: true, source: 'db' };
-  }
-  return scheduleVerify(async () => {
-    // Try transaction verification first
-    if (sig) {
-      for (let i = 0; i < VERIFY_RETRIES; i++) {
-        const r = await verifyMintViaTransaction(sig, candidate);
-        if (r.ok) {
-          verifiedCache.set(candidate, { verifiedAt: Date.now() });
-          await markTokenVerified(candidate, r.metadata);
-          return { ok: true, method: 'transaction', metadata: r.metadata };
+  _load() {
+    try {
+      if (fs.existsSync(DEDUP_FILE)) {
+        const arr = JSON.parse(fs.readFileSync(DEDUP_FILE, "utf8"));
+        if (Array.isArray(arr)) {
+          for (const [k, v] of arr) this.map.set(k, v);
         }
-        const base = VERIFY_BASE_DELAY_MS * Math.pow(2, i);
-        await sleep(currentThrottleDelay(base));
+      }
+    } catch (e) {
+      console.warn("[dedup] load error, starting empty:", e?.message || e);
+      this.map.clear();
+    }
+  }
+  _save(force = false) {
+    try {
+      if (!this.dirty && !force) return;
+      fs.writeFileSync(DEDUP_FILE, JSON.stringify([...this.map.entries()]));
+      this.dirty = false;
+    } catch (e) {
+      console.warn("[dedup] save error:", e?.message || e);
+    }
+  }
+  _startPruner() {
+    setInterval(() => {
+      const now = (Date.now() / 1000) | 0;
+      let removed = 0;
+      for (const [k, exp] of this.map.entries()) {
+        if (exp && exp > 0 && exp <= now) {
+          this.map.delete(k);
+          removed++;
+        }
+      }
+      if (removed > 0) this._save();
+    }, 10 * 60 * 1000).unref();
+  }
+}
+const dedup = new Dedup();
+// ======================================================================
+// DEDUP END
+// ======================================================================
+
+// =========================
+// Telegram notify
+// =========================
+let __tgBot = null;
+function ensureBot() {
+  if (!__tgBot) {
+    const tok = process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN;
+    if (!tok) return null;
+    __tgBot = new TelegramBot(tok, { polling: false });
+  }
+  return __tgBot;
+}
+async function notify(event) {
+  const bot = ensureBot();
+  const chatId = process.env.TELEGRAM_CHAT_ID || process.env.CHAT_ID;
+  if (!bot || !chatId) return;
+
+  const url = `https://solscan.io/tx/${event.signature}`;
+  const base = event.mints?.base;
+  const quote = event.mints?.quote;
+  const baseAmt = event.amounts?.base_in ?? 0;
+  const quoteAmt = event.amounts?.quote_in ?? 0;
+  const fmt = (mint, amt) => (mint ? `• ${amt} ${mint}` : "");
+
+  // Simplified alert: only essential info (mint addresses, amounts, DEX, link)
+  const body = `🧪 *LP Detected* — ${event.dex}\n` +
+               `*Mints*: \`${base || "unknown"}\` / \`${quote || "unknown"}\`\n` +
+               `*Amounts*:\n${fmt(base, baseAmt)}\n${fmt(quote, quoteAmt)}\n` +
+               `[Solscan](${url})`;
+
+  await bot.sendMessage(chatId, body, { parse_mode: "Markdown" });
+}
+
+// =========================
+// HTTP endpoint pool + 429 circuit breaker (1 evt/sec target)
+// =========================
+const PRIMARY_HTTP = (process.env.RPC_HTTP_URL || process.env.RPC_URL || "").trim();
+const ALT_HTTP = (process.env.RPC_ALT_URLS || "").split(",").map(s => s.trim()).filter(Boolean);
+const HTTP_URLS = [PRIMARY_HTTP, ...ALT_HTTP].filter(Boolean);
+if (HTTP_URLS.length === 0) {
+  throw new Error("Configure RPC_HTTP_URL (and optionally RPC_ALT_URLS)");
+}
+
+let __httpIndex = 0;
+function nextHttpUrl() {
+  __httpIndex = (__httpIndex + 1) % HTTP_URLS.length;
+  return HTTP_URLS[__httpIndex];
+}
+
+const CIRCUIT_429_THRESHOLD = envInt("CIRCUIT_429_THRESHOLD");
+const CIRCUIT_OPEN_MS = envInt("CIRCUIT_OPEN_MS");
+let __429Count = 0;
+let __circuitOpenUntil = 0;
+function circuitOpen() { return Date.now() < __circuitOpenUntil; }
+function on429() {
+  __429Count += 1;
+  if (__429Count >= CIRCUIT_429_THRESHOLD) {
+    __circuitOpenUntil = Date.now() + CIRCUIT_OPEN_MS;
+    log.warn({ cooldown_ms: CIRCUIT_OPEN_MS }, "[429] circuit OPEN");
+    __429Count = 0;
+  }
+}
+function on429Success() { __429Count = 0; }
+
+// Fixed-rate scheduler (guarantees ≥1 op/s if RATE_LIMIT_RPS ≥ 1)
+let RATE_RPS = Math.max(0.1, parseFloat(process.env.RATE_LIMIT_RPS || "1"));
+let TICK_MS = Math.max(
+  Math.floor(1000 / Math.max(RATE_RPS, 0.01)),
+  envInt("RATE_LIMIT_REFILL_MS")
+);
+const AFTER_HTTP_MS = envInt("AFTER_HTTP_MS");
+
+const __httpQueue = [];
+let __tickTimer = null;
+function scheduleHttp(fn) {
+  return new Promise((resolve, reject) => {
+    __httpQueue.push({ fn, resolve, reject });
+    if (!__tickTimer) __tickTimer = setInterval(drainHttpQueue, TICK_MS);
+  });
+}
+async function drainHttpQueue() {
+  if (circuitOpen()) return;
+  const item = __httpQueue.shift();
+  if (!item) { clearInterval(__tickTimer); __tickTimer = null; return; }
+  const { fn, resolve, reject } = item;
+  try {
+    const res = await fn();
+    on429Success();
+    if (AFTER_HTTP_MS > 0) await sleep(AFTER_HTTP_MS);
+    resolve(res);
+  } catch (e) {
+    reject(e);
+  }
+}
+
+// Dynamic throttle: backs off on 429s, slowly increases after stability
+let __stableOk = 0;
+async function throttleOnResult(errMaybe) {
+  if (errMaybe && String(errMaybe).toLowerCase().includes("429")) {
+    on429();
+    const floor = PLAN === "free" ? 1 : 3;
+    RATE_RPS = Math.max(floor, Math.floor(RATE_RPS * 0.7));
+    TICK_MS = Math.max(1000 / RATE_RPS, envInt("RATE_LIMIT_REFILL_MS"));
+    log.warn({ RATE_RPS, TICK_MS }, "[429] throttle down");
+    __stableOk = 0;
+  } else {
+    __stableOk++;
+    if (__stableOk % 30 === 0) {
+      const cap = parseFloat(process.env.RATE_LIMIT_RPS || (PLAN === "free" ? "1" : "8"));
+      if (RATE_RPS < cap) {
+        RATE_RPS = Math.min(cap, RATE_RPS + 1);
+        TICK_MS = Math.max(1000 / RATE_RPS, envInt("RATE_LIMIT_REFILL_MS"));
+        log.info({ RATE_RPS, TICK_MS }, "[ok] throttle up");
       }
     }
-    // Fallback to account inspection
-    for (let i = 0; i < VERIFY_RETRIES; i++) {
-      const r2 = await verifyMintViaAccount(candidate);
-      if (r2.ok) {
-        verifiedCache.set(candidate, { verifiedAt: Date.now() });
-        await markTokenVerified(candidate, r2.metadata);
-        return { ok: true, method: 'account', metadata: r2.metadata };
+  }
+}
+
+// =========================
+// HTTP Connection pool (round-robin on 429)
+// =========================
+function makeHttpConnection(url) {
+  const commitment = process.env.RPC_COMMITMENT || process.env.COMMITMENT || "confirmed";
+  return new SolConn(url, { commitment });
+}
+let __httpConns = HTTP_URLS.map(makeHttpConnection);
+function getHttpConn() {
+  if (__httpConns.length === 0) __httpConns = [makeHttpConnection(PRIMARY_HTTP)];
+  return __httpConns[__httpIndex];
+}
+function rotateHttpConn() {
+  if (HTTP_URLS.length <= 1) return getHttpConn();
+  const url = nextHttpUrl();
+  log.warn({ url }, "[429] rotating HTTP endpoint");
+  __httpConns[__httpIndex] = makeHttpConnection(url);
+  return __httpConns[__httpIndex];
+}
+
+// =========================
+// Providers (WS / Webhook) — multiple modes
+// =========================
+function providerLabel(mode) { return mode; }
+function makeWsConnection(wsUrl, httpUrl) {
+  const commitment = process.env.COMMITMENT || "confirmed";
+  return new Connection(httpUrl || PRIMARY_HTTP, { commitment, wsEndpoint: wsUrl });
+}
+async function onProgramLogsWs(conn, programId, callback, label = "ws") {
+  const id = await conn.onLogs(
+    new PublicKey(programId),
+    async (logs, ctx) => {
+      try {
+        await callback({ logs, ctx });
+      } catch (e) {
+        console.error(`[onLogs cb ${label}]`, e);
       }
-      const base = VERIFY_BASE_DELAY_MS * Math.pow(2, i);
-      await sleep(currentThrottleDelay(base));
+    },
+    process.env.WS_COMMITMENT || "processed"
+  );
+  return id;
+}
+async function onLogsAllWs(conn, callback, label = "logs_all") {
+  const id = await conn.onLogs(
+    "all",
+    async (logs, ctx) => {
+      try {
+        await callback({ logs, ctx });
+      } catch (e) {
+        console.error(`[onLogs all ${label}]`, e);
+      }
+    },
+    process.env.WS_COMMITMENT || "processed"
+  );
+  return id;
+}
+async function onProgramAccountsWs(conn, programId, callback, label = "program_subscribe") {
+  // Note: this callback does NOT provide a signature; used only for side metrics
+  const id = await conn.onProgramAccountChange(
+    new PublicKey(programId),
+    async (info, ctx) => {
+      try {
+        await callback({ info, ctx, programId });
+      } catch (e) {
+        console.error(`[onProgramAccount ${label}]`, e);
+      }
+    },
+    process.env.WS_COMMITMENT || "processed"
+  );
+  return id;
+}
+
+// Webhook (Helius/QuickNode Streams)
+function startWebhookAt(path, onTxLike) {
+  const app = startWebhookAt.__app || express();
+  startWebhookAt.__app = app;
+
+  if (!startWebhookAt.__listening) {
+    app.use(express.json({ limit: "4mb" }));
+    const port = envInt("WEBHOOK_PORT", 8080);
+    app.listen(port, () => console.log(`[webhook] listening on :${port}`));
+    startWebhookAt.__listening = true;
+  }
+  const secret = (process.env.WEBHOOK_SHARED_SECRET || "").trim();
+  const hdrName = process.env.WEBHOOK_SECRET_HEADER || "X-Shared-Secret";
+
+  app.post(path, async (req, res) => {
+    try {
+      if (secret) {
+        const headerToken = req.header(hdrName) || "";
+        const queryToken = req.query.token || "";
+        if (headerToken !== secret && String(queryToken) !== secret) {
+          return res.status(401).json({ ok: false, error: "unauthorized" });
+        }
+      }
+      const body = req.body;
+      const txs = Array.isArray(body) ? body : (body?.transactions || body?.data || [body]);
+      for (const tx of txs) {
+        // Gate by target PIDs (avoid noise)
+        if (!txLikeTouchesAnyPid(tx)) continue;
+        const sig = tx?.transaction?.signatures?.[0] || tx?.signature;
+        if (sig) enqueue(sig);
+      }
+      res.json({ ok: true });
+    } catch (e) {
+      console.error(`[webhook ${path}] error:`, e);
+      res.status(500).json({ ok: false, error: String(e) });
     }
-    return { ok: false };
   });
 }
 
-/* =====================================
- * Candidate extraction and helpers
- * ===================================*/
-const reBase58 = /([1-9A-HJ-NP-Za-km-z]{32,44})/g;
-function extractCandidatesFromLogs(logs) {
-  const scores = new Map();
-  for (const raw of logs || []) {
-    if (typeof raw !== 'string') continue;
-    if (!/[1-9A-HJ-NP-Za-km-z]/.test(raw)) continue;
-    let m;
-    while ((m = reBase58.exec(raw)) !== null) {
-      const candidate = m[1];
-      if (!candidate) continue;
-      let score = scores.get(candidate) || 0;
-      if (liquidityMarkers.some(rx => rx.test(raw))) score += 3;
-      for (const pid of PROGRAM_IDS) {
-        if (pid && raw.includes(pid)) { score += 2; break; }
+// One canonical makeConnection (avoid duplicates)
+function makeConnection() {
+  const mode = String(process.env.PROVIDER_MODE || "solana_ws").toLowerCase();
+  let ws = process.env.RPC_WS_URL || undefined;
+  if (mode === "quicknode_ws" && process.env.QUICKNODE_WS_URL) ws = process.env.QUICKNODE_WS_URL;
+  if (mode === "helius_ws" && process.env.HELIUS_ENHANCED_WS_URL) ws = process.env.HELIUS_ENHANCED_WS_URL;
+  const http = PRIMARY_HTTP;
+  const commitment = process.env.COMMITMENT || "confirmed";
+  return new Connection(http, { commitment, wsEndpoint: ws });
+}
+
+// Multi-provider factory
+function providersFactory() {
+  const modes = String(process.env.PROVIDER_MODES || process.env.PROVIDER_MODE || "solana_ws")
+    .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+
+  const list = [];
+  for (const mode of modes) {
+    if (mode === "solana_ws") {
+      const wsUrl = process.env.RPC_WS_URL || undefined;
+      const conn = makeWsConnection(wsUrl, PRIMARY_HTTP);
+      list.push({
+        mode,
+        label: providerLabel(mode),
+        connection: conn,
+        onProgramLogs: (pid, cb) => onProgramLogsWs(conn, pid, cb, mode),
+        type: "ws"
+      });
+      continue;
+    }
+    if (mode === "helius_ws") {
+      const wsUrl = process.env.HELIUS_ENHANCED_WS_URL;
+      if (!wsUrl) {
+        log.warn({ mode }, "helius_ws requires HELIUS_ENHANCED_WS_URL");
+        continue;
       }
-      if (/Program log:|invoke \[|success/i.test(raw)) score += 1;
-      scores.set(candidate, Math.max(scores.get(candidate) || 0, score));
+      const conn = makeWsConnection(wsUrl, PRIMARY_HTTP);
+      list.push({
+        mode,
+        label: providerLabel(mode),
+        connection: conn,
+        onProgramLogs: (pid, cb) => onProgramLogsWs(conn, pid, cb, mode),
+        type: "ws"
+      });
+      continue;
+    }
+    if (mode === "quicknode_ws") {
+      const wsUrl = process.env.QUICKNODE_WS_URL;
+      if (!wsUrl) {
+        log.warn({ mode }, "quicknode_ws requires QUICKNODE_WS_URL");
+        continue;
+      }
+      const conn = makeWsConnection(wsUrl, PRIMARY_HTTP);
+      list.push({
+        mode,
+        label: providerLabel(mode),
+        connection: conn,
+        onProgramLogs: (pid, cb) => onProgramLogsWs(conn, pid, cb, mode),
+        type: "ws"
+      });
+      continue;
+    }
+    if (mode === "webhook_helius") {
+      const path = process.env.WEBHOOK_HELIUS_PATH || "/streams/helius";
+      startWebhookAt(path, () => {});
+      const conn = makeConnection();
+      list.push({
+        mode,
+        label: providerLabel(mode),
+        connection: conn,
+        onProgramLogs: async () => "webhook_helius",
+        type: "webhook"
+      });
+      continue;
+    }
+    if (mode === "webhook_quicknode") {
+      const path = process.env.WEBHOOK_QN_PATH || "/streams/qn";
+      startWebhookAt(path, () => {});
+      const conn = makeConnection();
+      list.push({
+        mode,
+        label: providerLabel(mode),
+        connection: conn,
+        onProgramLogs: async () => "webhook_quicknode",
+        type: "webhook"
+      });
+      continue;
+    }
+    log.warn({ mode }, "provider mode not recognized — ignoring");
+  }
+
+  if (list.length === 0) {
+    const conn = makeConnection();
+    list.push({
+      mode: "solana_ws",
+      label: "solana_ws",
+      connection: conn,
+      onProgramLogs: (pid, cb) => onProgramLogsWs(conn, pid, cb, "solana_ws"),
+      type: "ws"
+    });
+  }
+  return list;
+}
+
+// =========================
+// Balance helpers
+// =========================
+function computeTokenDeltas(meta) {
+  const pre = meta?.preTokenBalances || [];
+  const post = meta?.postTokenBalances || [];
+  const index = new Map();
+
+  for (const x of pre) {
+    index.set(x.accountIndex, {
+      mint: x.mint,
+      owner: x.owner,
+      pre: Number(x.uiTokenAmount?.uiAmountString ?? x.uiTokenAmount?.uiAmount ?? 0),
+      post: 0
+    });
+  }
+  for (const y of post) {
+    const slot = index.get(y.accountIndex) || { mint: y.mint, owner: y.owner, pre: 0, post: 0 };
+    slot.post = Number(y.uiTokenAmount?.uiAmountString ?? y.uiTokenAmount?.uiAmount ?? 0);
+    slot.mint = y.mint;
+    slot.owner = y.owner;
+    index.set(y.accountIndex, slot);
+  }
+
+  const entries = [...index.values()];
+  const byOwner = new Map();
+  for (const e of entries) {
+    const delta = e.post - e.pre;
+    const ownerKey = e.owner;
+    if (!byOwner.has(ownerKey)) byOwner.set(ownerKey, []);
+    byOwner.get(ownerKey).push({ mint: e.mint, delta });
+  }
+  return { entries, byOwner };
+}
+
+function findBestOwnerForInflows(byOwner, userWallet) {
+  // choose the owner with the most positive inflows (not the userWallet)
+  let best = null;
+  for (const [owner, list] of byOwner.entries()) {
+    if (owner && userWallet && owner === userWallet) continue;
+    const inflows = list.filter(x => x.delta > 0 && isValidMint(x.mint));
+    if (inflows.length >= 1) {
+      const score = inflows.reduce((s, x) => s + x.delta, 0);
+      if (!best || inflows.length > best.inflows || (inflows.length === best.inflows && score > best.score)) {
+        best = { owner, inflows: inflows.length, score };
+      }
     }
   }
-  return [...scores.entries()].sort((a, b) => b[1] - a[1]).map(([candidate, score]) => ({ candidate, score }));
+  return best?.owner || null;
 }
-function findProgramInLogs(logs) {
-  if (!Array.isArray(logs)) return null;
-  for (const line of logs) {
-    if (typeof line !== 'string') continue;
-    for (const p of PROGRAMS) {
-      if (p && p.id && line.includes(p.id)) return p.id;
+
+function inferMintsAndAmountsFromMeta(meta, userWallet) {
+  const { byOwner } = computeTokenDeltas(meta);
+  const vaultOwner = findBestOwnerForInflows(byOwner, userWallet);
+
+  // 1) First: inflows to the vaultOwner
+  let inflows = (byOwner.get(vaultOwner) || [])
+    .filter(x => x.delta > 0 && isValidMint(x.mint))
+    .sort((a, b) => b.delta - a.delta);
+
+  // 2) If none, consider all positive inflows (except user wallet)
+  if (inflows.length === 0) {
+    const allInflows = [];
+    for (const [owner, list] of byOwner.entries()) {
+      if (owner && userWallet && owner === userWallet) continue;
+      for (const it of list) {
+        if (it.delta > 0 && isValidMint(it.mint)) allInflows.push(it);
+      }
     }
+    inflows = allInflows.sort((a, b) => b.delta - a.delta);
+  }
+
+  let base_in = 0, quote_in = 0;
+  let base_mint = null, quote_mint = null;
+
+  if (inflows[0]) {
+    base_mint = inflows[0].mint;
+    base_in = inflows[0].delta;
+  }
+  if (inflows[1]) {
+    quote_mint = inflows[1].mint;
+    quote_in = inflows[1].delta;
+  }
+
+  // 3) If only one inflow found, try to find the second via userWallet outflows
+  if (!quote_mint && userWallet) {
+    const negs = (byOwner.get(userWallet) || [])
+      .filter(x => x.delta < 0 && isValidMint(x.mint))
+      .sort((a, b) => a.delta - b.delta);
+    if (negs[0]) {
+      quote_mint = negs[0].mint;
+      quote_in = 0;
+    }
+  }
+
+  return { vaultOwner, base_mint, quote_mint, base_in, quote_in };
+}
+
+// =========================
+// Mint age helpers
+// =========================
+function isTodayFromBlockTime(blockTimeSec) {
+  if (!blockTimeSec) return null;
+  const now = new Date();
+  const start = Math.floor(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()) / 1000);
+  const end = start + 86400;
+  return (blockTimeSec >= start && blockTimeSec < end);
+}
+async function mintedToday(connection, mint) {
+  const onlyToday = String(process.env.ONLY_TODAY || "true").toLowerCase() === "true";
+  if (!onlyToday) return true;
+  const doLookup = String(process.env.ONLY_TODAY_LOOKUP || "true").toLowerCase() === "true";
+  if (!doLookup) return true;
+
+  const max = parseInt(process.env.MAX_FETCH_SIGNATURES || "250", 10);
+  try {
+    let before = undefined;
+    let minTime = Number.MAX_SAFE_INTEGER;
+    let fetched = 0;
+    const httpConn = getHttpConn();
+    while (fetched < max) {
+      const list = await scheduleHttp(async () => {
+        try {
+          return await httpConn.getSignaturesForAddress(mint, {
+            limit: Math.min(100, max - fetched),
+            before,
+            commitment: "confirmed"
+          });
+        } catch (e) {
+          const msg = String(e?.message || e).toLowerCase();
+          if (msg.includes("429") || msg.includes("too many requests")) {
+            on429();
+            rotateHttpConn();
+          }
+          await throttleOnResult(e);
+          throw e;
+        }
+      });
+      if (list.length === 0) break;
+      for (const s of list) {
+        if (s.blockTime) {
+          minTime = Math.min(minTime, s.blockTime);
+        }
+      }
+      fetched += list.length;
+      before = list[list.length - 1].signature;
+      if (minTime !== Number.MAX_SAFE_INTEGER) break;
+    }
+    const today = isTodayFromBlockTime(minTime);
+    return today === null ? true : today;
+  } catch (e) {
+    console.warn("[mintedToday] error, fallback true:", e);
+    return true;
+  }
+}
+
+// =========================
+// Parsers — Meteora DLMM
+// =========================
+const METEORA_DLMM = {
+  label: "Meteora DLMM",
+  programId: "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+  markers: [
+    "InitializePosition",
+    "InitializePositionAndAddLiquidity",
+    "AddLiquidity",
+    "AddLiquidityByStrategy",
+    "AddLiquidityByStrategy2",
+    "AddLiquidityByWeight",
+    "IncreaseLiquidity"
+  ]
+};
+function looksLikeMeteoraLiquidity(logs) {
+  const L = logs || [];
+  return L.some(l => METEORA_DLMM.markers.some(m => l.includes(m)));
+}
+function parseMeteoraLiquidity(tx) {
+  const meta = tx?.meta;
+  const logs = meta?.logMessages || [];
+  if (!looksLikeMeteoraLiquidity(logs)) return null;
+
+  const keys = tx?.transaction?.message?.accountKeys || [];
+  const firstKey = getKeyPubkey(keys[0]);
+  const userWallet = firstKey ? safePkStr(firstKey) : null;
+
+  const { vaultOwner, base_mint, quote_mint, base_in, quote_in } = inferMintsAndAmountsFromMeta(meta, userWallet);
+
+  const markersHit = METEORA_DLMM.markers.filter(m => logs.some(l => l.includes(m)));
+  return {
+    dex: METEORA_DLMM.label,
+    program_id: METEORA_DLMM.programId,
+    signature: tx?.transaction?.signatures?.[0] || tx?.signature || "unknown",
+    slot: tx?.slot || 0,
+    timestamp: tx?.blockTime || 0,
+    user_wallet: userWallet,
+    pool_authority: vaultOwner,
+    mints: { base: base_mint, quote: quote_mint },
+    amounts: { base_in, quote_in },
+    single_sided: (quote_in === 0 || !quote_mint),
+    markers: markersHit
+  };
+}
+
+// =========================
+// Parsers — Kamino→Meteora
+// =========================
+const KAMINO_YVAULTS = {
+  name: "Kamino yVaults",
+  programId: "6LtLpnUFNByNXLyCoK9wA2MykKAmQNZKBdY8s47dehDc",
+  markers: ["Invest"]
+};
+const METEORA_DLMM_PID = METEORA_DLMM.programId;
+function _hasAny(logs, needles) {
+  return (logs || []).some(l => needles.some(n => l.includes(n)));
+}
+function looksLikeKaminoInvest(tx) {
+  const logs = tx?.meta?.logMessages || [];
+  const keys = tx?.transaction?.message?.accountKeys || [];
+  const hasKamino = keys.some(k => getKeyPubkey(k) === KAMINO_YVAULTS.programId);
+  const mentionsInvest = _hasAny(logs, KAMINO_YVAULTS.markers);
+  const touchesMeteora = keys.some(k => getKeyPubkey(k) === METEORA_DLMM_PID);
+
+  return (hasKamino && mentionsInvest && touchesMeteora);
+}
+function parseKaminoInvest(tx) {
+  if (!looksLikeKaminoInvest(tx)) return null;
+  const meta = tx?.meta;
+  const logs = meta?.logMessages || [];
+  const keys = tx?.transaction?.message?.accountKeys || [];
+  const firstKey = getKeyPubkey(keys[0]);
+  const userWallet = firstKey ? safePkStr(firstKey) : null;
+
+  const { vaultOwner, base_mint, quote_mint, base_in, quote_in } = inferMintsAndAmountsFromMeta(meta, userWallet);
+
+  const markersHit = []
+    .concat(KAMINO_YVAULTS.markers.filter(m => logs.some(l => l.includes(m))))
+    .concat(logs.some(l => l.includes("AddLiquidity")) ? ["AddLiquidity*"] : []);
+  return {
+    dex: "Kamino→Meteora DLMM",
+    program_id: KAMINO_YVAULTS.programId,
+    routed_program: METEORA_DLMM_PID,
+    signature: tx?.transaction?.signatures?.[0] || tx?.signature || "unknown",
+    slot: tx?.slot || 0,
+    timestamp: tx?.blockTime || 0,
+    user_wallet: userWallet,
+    pool_authority: vaultOwner,
+    mints: { base: base_mint, quote: quote_mint },
+    amounts: { base_in, quote_in },
+    single_sided: (quote_in === 0 || !quote_mint),
+    markers: markersHit
+  };
+}
+
+// =========================
+// Parsers — Orca Whirlpools
+// =========================
+const ORCA_WHIRLPOOLS = {
+  name: "Orca Whirlpools",
+  programId: "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
+  markers: ["initializePool", "initializeTickArray", "increaseLiquidity", "decreaseLiquidity", "openPosition"]
+};
+function looksLikeOrca(tx) {
+  const logs = tx?.meta?.logMessages || [];
+  const hasPid = tx?.transaction?.message?.accountKeys?.some(
+    k => getKeyPubkey(k) === ORCA_WHIRLPOOLS.programId
+  );
+  const hasMarker = logs?.some(l => ORCA_WHIRLPOOLS.markers.some(m => l.includes(m)));
+  return !!(hasPid && hasMarker);
+}
+function parseOrcaLiquidity(tx) {
+  if (!looksLikeOrca(tx)) return null;
+  const meta = tx?.meta;
+  const logs = meta?.logMessages || [];
+  const keys = tx?.transaction?.message?.accountKeys || [];
+  const firstKey = getKeyPubkey(keys[0]);
+  const userWallet = firstKey ? safePkStr(firstKey) : null;
+
+  const { vaultOwner, base_mint, quote_mint, base_in, quote_in } = inferMintsAndAmountsFromMeta(meta, userWallet);
+
+  const markersHit = ORCA_WHIRLPOOLS.markers.filter(m => logs.some(l => l.includes(m)));
+  return {
+    dex: "Orca Whirlpools",
+    program_id: ORCA_WHIRLPOOLS.programId,
+    signature: tx?.transaction?.signatures?.[0] || tx?.signature || "unknown",
+    slot: tx?.slot || 0,
+    timestamp: tx?.blockTime || 0,
+    user_wallet: userWallet,
+    pool_authority: vaultOwner,
+    mints: { base: base_mint, quote: quote_mint },
+    amounts: { base_in, quote_in },
+    single_sided: (quote_in === 0 || !quote_mint),
+    markers: markersHit
+  };
+}
+
+// =========================
+// Generic parser for other DEXes (from programs.json config)
+// =========================
+function parseGenericDex(tx, dexCfg) {
+  const logs = tx?.meta?.logMessages || [];
+  const keys = tx?.transaction?.message?.accountKeys || [];
+  const programIds = dexCfg.programIds || [];
+  const markers = (dexCfg.liquidityMarkers || []).map(s => s.toLowerCase());
+
+  const hasProgram = keys?.some(k => programIds.includes(getKeyPubkey(k)));
+  if (!hasProgram) return null;
+
+  const requireMarker = envBool("GENERIC_REQUIRE_MARKER", true);
+  const hasMarker = logs?.some(l => markers.some(m => l.toLowerCase().includes(m)));
+  if (requireMarker && !hasMarker) return null;
+
+  // Infer mints via token delta (same routine as others)
+  const meta = tx?.meta;
+  const firstKey = getKeyPubkey(keys[0]);
+  const userWallet = firstKey ? safePkStr(firstKey) : null;
+  const { vaultOwner, base_mint, quote_mint, base_in, quote_in } = inferMintsAndAmountsFromMeta(meta, userWallet);
+
+  return {
+    dex: dexCfg.name || "Unknown DEX",
+    program_id: programIds[0] || "unknown",
+    signature: tx?.transaction?.signatures?.[0] || tx?.signature || "unknown",
+    slot: tx?.slot || 0,
+    timestamp: tx?.blockTime || 0,
+    user_wallet: userWallet,
+    pool_authority: vaultOwner,
+    mints: { base: base_mint, quote: quote_mint },
+    amounts: { base_in, quote_in },
+    single_sided: (quote_in === 0 || !quote_mint),
+    markers: markers.filter(m => logs?.some(l => l.toLowerCase().includes(m)))
+  };
+}
+
+// =========================
+// programs.json loader (+ includeFiles merger) + programLogs list
+// =========================
+let EXTRA_DEX = [];
+let PROGRAM_LOGS_LIST = [];
+function loadDexPrograms() {
+  try {
+    const raw = fs.readFileSync("programs.json", "utf8");
+    const cfg = JSON.parse(raw);
+    EXTRA_DEX = cfg.dexes || [];
+
+    // programLogs (list of PIDs for priority use)
+    PROGRAM_LOGS_LIST = (cfg.programLogs || cfg.logs || []).map(String).filter(Boolean);
+
+    const includes = (cfg.includeFiles || []).map(s => s.trim()).filter(Boolean);
+    for (const inc of includes) {
+      try {
+        const incPath = path.resolve(inc);
+        const text = fs.readFileSync(incPath, "utf8");
+        const data = JSON.parse(text);
+
+        const ids = new Set();
+        const pushAddr = a => { if (a && typeof a === "string") ids.add(a); };
+
+        if (Array.isArray(data)) {
+          for (const it of data) {
+            if (typeof it === "string") pushAddr(it);
+            else if (it?.address) pushAddr(it.address);
+            else if (it?.programId) pushAddr(it.programId);
+          }
+        } else if (typeof data === "object") {
+          if (data.address) pushAddr(data.address);
+          if (data.programId) pushAddr(data.programId);
+          if (Array.isArray(data.addresses)) data.addresses.forEach(pushAddr);
+          if (Array.isArray(data.programIds)) data.programIds.forEach(pushAddr);
+        }
+
+        if (ids.size > 0) {
+          const baseName = path.basename(inc).replace(/\.json$/i, "");
+          EXTRA_DEX.push({
+            name: baseName,
+            programIds: [...ids],
+            liquidityMarkers: cfg.defaultMarkers || [
+              "addliquidity", "initialize", "openposition",
+              "increaseliquidity", "deposit", "create", "swap"
+            ]
+          });
+        }
+      } catch (e) {
+        log.warn({ file: inc, err: String(e) }, "include parse failed (skipped)");
+      }
+    }
+    return { meteora: cfg.meteora || METEORA_DLMM, extra: EXTRA_DEX };
+  } catch {
+    // fallback: only Meteora
+    PROGRAM_LOGS_LIST = [];
+    return { meteora: METEORA_DLMM, extra: [] };
+  }
+}
+
+// =========================
+// Router – classify transaction into a known DEX event
+// =========================
+function classifyLiquidity(tx) {
+  // 1) Kamino→Meteora
+  const k = parseKaminoInvest(tx);
+  if (k) return k;
+  // 2) Meteora
+  const m = parseMeteoraLiquidity(tx);
+  if (m) return m;
+  // 3) Orca
+  const o = parseOrcaLiquidity(tx);
+  if (o) return o;
+  // 4) Generic (e.g. Raydium, Pump, Jupiter as per programs.json)
+  for (const dex of EXTRA_DEX) {
+    const g = parseGenericDex(tx, dex);
+    if (g) return g;
   }
   return null;
 }
 
-/* =====================================
- * Fallback inspector: programNotification pubkey -> signatures -> tx -> mint
- * ===================================*/
-async function getRecentSignaturesForAddress(pubkey, limit = FALLBACK_SIGNATURE_LIMIT) {
-  if (!RPC_URL) return [];
-  try {
-    const body = { jsonrpc: '2.0', id: 1, method: 'getSignaturesForAddress', params: [pubkey, { limit }] };
-    const data = await httpPostWithRetry(RPC_URL, body);
-    return Array.isArray(data?.result) ? data.result : [];
-  } catch (e) {
-    debugLog('getRecentSignaturesForAddress error', e?.message || e);
-    return [];
+// =========================
+// Dedup + queue (signatures) — keep ≥ 1 evt/sec flow
+// =========================
+const CONCURRENCY = envInt("CONCURRENCY");
+const __pending = new Set();
+const __queue = [];
+let __active = 0;
+const RESERVOIR_MAX = envInt("RESERVOIR_MAX", 3000);
+
+function enqueue(signature) {
+  if (!signature || __pending.has(signature)) return;
+  __pending.add(signature);
+  __queue.push(signature);
+  if (__queue.length > RESERVOIR_MAX) {
+    __queue.splice(0, __queue.length - RESERVOIR_MAX);
   }
+  pump();
 }
-async function inspectSignaturesForMint(pubkey, limit = FALLBACK_SIGNATURE_LIMIT) {
-  try {
-    const last = inspectingPubkeys.get(pubkey);
-    if (last && (Date.now() - last) < INSPECT_TTL_MS) {
-      debugLog('inspectSignaturesForMint: skipping TTL for', pubkey);
-      return false;
-    }
-    inspectingPubkeys.set(pubkey, Date.now());
-    await acquireInspectSlot();
+async function worker(connection) {
+  while (true) {
+    const sig = __queue.shift();
+    if (!sig) return;
     try {
-      const sigRows = await getRecentSignaturesForAddress(pubkey, limit);
-      if (!sigRows.length) return false;
-      for (const row of sigRows) {
-        const signature = row?.signature || (typeof row === 'string' ? row : null);
-        if (!signature) continue;
-        const tx = await getTransactionParsed(signature);
-        if (!tx) continue;
-        const blockTime = tx.blockTime || null;
-        if (ONLY_TODAY && blockTime && !isTodayInTZ(blockTime, USER_TZ)) continue;
-        if (!isFreshByAge(blockTime || Math.floor(Date.now() / 1000))) continue;
-        // Optionally use Solscan for chain info (we can call and log but not required)
-        // 1) Check postTokenBalances
-        const post = tx.meta?.postTokenBalances || [];
-        for (const p of post) {
-          if (p && p.mint) {
-            const mint = p.mint;
-            const pid = findProgramInLogs(tx.meta?.logMessages || []) || null;
-            await insertTokenRow(mint, signature, pid, 0, { source: 'fallback-post', info: p });
-            await enqueueNotification(mint, signature, pid);
-            return true;
-          }
-        }
-        // 2) Logs
-        const logs = tx.meta?.logMessages || [];
-        const candidates = extractCandidatesFromLogs(logs);
-        if (candidates && candidates.length) {
-          const top = candidates[0].candidate;
-          const pid = findProgramInLogs(logs) || null;
-          await insertTokenRow(top, signature, pid, 0, { source: 'fallback-log', score: candidates[0].score });
-          await enqueueNotification(top, signature, pid);
-          return true;
-        }
-      }
-      return false;
+      await fetchAndProcessTx(connection, sig);
+    } catch (e) {
+      log.error({ sig, err: String(e) }, "worker error");
     } finally {
-      releaseInspectSlot();
-      inspectingPubkeys.set(pubkey, Date.now());
+      __pending.delete(sig);
     }
-  } catch (e) {
-    debugLog('inspectSignaturesForMint error', e?.message || e);
-    return false;
+  }
+}
+function pump(connRef) {
+  const connection = connRef || global.__CONNECTION__;
+  while (__active < CONCURRENCY && __queue.length > 0) {
+    __active++;
+    worker(connection).finally(() => {
+      __active--;
+      setImmediate(() => pump(connection));
+    });
   }
 }
 
-/* =====================================
- * Notification queue
- * ===================================*/
-async function enqueueNotification(token, signature, pid) {
-  await insertTokenRow(token, signature, pid, 0, null);
-  if (!notifyQueue.some(x => x.token === token)) {
-    notifyQueue.push({ token, signature, pid, ts: Date.now() });
-  }
-  processNotifyQueue();
-}
-async function processNotifyQueue() {
-  if (notifyProcessing) return;
-  notifyProcessing = true;
-  try {
-    while (notifyQueue.length > 0) {
-      const item = notifyQueue.shift();
-      const { token, signature, pid, ts } = item;
-      const delay = DELAY_SECONDS - (Date.now() - ts);
-      if (delay > 0) await sleep(delay);
-      if (await isTokenNotified(token)) { debugLog('Already notified', token); continue; }
-      if (VERIFY_MINT_BEFORE_NOTIFY) {
-        const v = await verifyCandidate(signature, token);
-        if (!v.ok) { warn('Verification failed for', token); continue; }
-      }
-      const programLabel = PROGRAMS.find(p => p.id === pid)?.name || pid || 'Unknown';
-      const msg = `🚀 <b>New liquidity/pool detected!</b>\n\nDEX / Program: <b>${programLabel}</b>\nMint: <code>${token}</code>\nTx: <a href="https://solscan.io/tx/${signature}">Link</a>`;
-      const sent = await sendTelegram(msg);
-      if (sent && sent.ok) {
-        await markTokenNotified(token);
-        log('Notification sent for', token);
-      } else {
-        warn('Telegram failed for', token);
-        notifyQueue.push({ token, signature, pid, ts: Date.now() + 30000 });
-        await sleep(1000);
-      }
-    }
-  } catch (e) {
-    errLog('processNotifyQueue error', e?.message || e);
-  } finally {
-    notifyProcessing = false;
-  }
+// micro-jitter to smooth bursts
+async function handleSignature(connection, signature) {
+  if (!signature) return;
+  if (__pending.has(signature)) return;
+  const maxJitter = PLAN === "free" ? 90 : 40; // ms
+  await sleep(20 + Math.floor(Math.random() * maxJitter));
+  enqueue(signature);
 }
 
-/* =====================================
- * Event processing
- * ===================================*/
-async function processEvent(evt) {
+// =========================
+// Fetch & Process transaction (scheduled + handles 429 logic)
+// =========================
+function bothMintsValid(ev) {
+  const bOk = isValidMint(ev?.mints?.base);
+  const qOk = isValidMint(ev?.mints?.quote);
+  // Accept if at least one valid mint (single-sided LP). To require both, use (bOk && qOk).
+  return (bOk || qOk);
+}
+
+async function fetchAndProcessTx(_connForWs, signature) {
   try {
-    if (!evt) return;
-    // Program notifications may come without signature
-    if (evt.value && evt.value.pubkey && !evt.signature && !evt.txSignature) {
-      debugLog('Received programNotification pubkey', evt.value.pubkey);
-      await inspectSignaturesForMint(evt.value.pubkey).catch(() => {});
-      return;
-    }
-    const signature = evt.signature || evt.txSignature || (evt.transaction && evt.transaction.signatures && evt.transaction.signatures[0]);
-    if (!signature) return;
-    if (dumpedTxs.has(signature)) return;
-    dumpedTxs.add(signature);
-    setTimeout(() => dumpedTxs.delete(signature), 60000);
-    debugLog('Processing event', signature);
-    // Structured payloads
-    if (evt.tokenTransfers && evt.tokenTransfers.length) {
-      const mints = new Set();
-      for (const t of evt.tokenTransfers) if (t.mint) mints.add(t.mint);
-      const pid = findProgramInLogs(evt.logs) || null;
-      for (const mint of mints) {
-        await insertTokenRow(mint, signature, pid, 0, null);
-        await enqueueNotification(mint, signature, pid);
-      }
-      return;
-    }
-    if (evt.events && evt.events.amm) {
+    const httpConn = getHttpConn();
+    const tx = await scheduleHttp(async () => {
       try {
-        const amm = evt.events.amm;
-        const tokenA = amm.tokenA?.mint || amm.tokenA?.token?.mint;
-        const tokenB = amm.tokenB?.mint || amm.tokenB?.token?.mint;
-        const pid = findProgramInLogs(evt.logs) || null;
-        if (tokenA) { await insertTokenRow(tokenA, signature, pid, 0, null); await enqueueNotification(tokenA, signature, pid); }
-        if (tokenB) { await insertTokenRow(tokenB, signature, pid, 0, null); await enqueueNotification(tokenB, signature, pid); }
-        return;
+        return await httpConn.getTransaction(signature, {
+          maxSupportedTransactionVersion: 0,
+          commitment: "confirmed"
+        });
       } catch (e) {
-        debugLog('AMM parse error', e?.message || e);
+        const msg = String(e?.message || e).toLowerCase();
+        if (msg.includes("429") || msg.includes("too many requests")) {
+          on429();
+          rotateHttpConn();
+        }
+        await throttleOnResult(e);
+        throw e;
       }
-    }
-    if (!evt.logs || !Array.isArray(evt.logs)) return;
-    // Owner whitelist check
-    if (EFFECTIVE_WHITELIST.length) {
-      const inWl = evt.logs.some(line => typeof line === 'string' && EFFECTIVE_WHITELIST.some(pid => pid && line.includes(pid)));
-      if (!inWl) return;
-    }
-    // Program IDs filter
-    if (PROGRAM_IDS.length) {
-      const hasProg = evt.logs.some(line => typeof line === 'string' && PROGRAM_IDS.some(pid => pid && line.includes(pid)));
-      if (!hasProg) return;
-    }
-    // Liquidity markers
-    const hasMark = evt.logs.some(l => liquidityMarkers.some(rx => rx.test(String(l))));
-    if (!hasMark) return;
-    debugLog('Liquidity markers found for', signature);
-    const candidates = extractCandidatesFromLogs(evt.logs);
-    if (!candidates.length) return;
-    for (const { candidate } of candidates) {
-      const v = await verifyCandidate(signature, candidate);
-      if (v.ok) {
-        const pid = findProgramInLogs(evt.logs);
-        await insertTokenRow(candidate, signature, pid, 1, v.metadata || null);
-        await enqueueNotification(candidate, signature, pid);
-        log('Verified & notified', candidate);
-        return;
-      }
-    }
-  } catch (e) {
-    errLog('processEvent error', e?.message || e);
-  }
-}
+    });
+    if (!tx) return;
 
-/* =====================================
- * WebSocket connection & subscription
- * ===================================*/
-function getWsUrl() {
-  if (HELIUS_API_KEY) return `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
-  if (RPC_URL) return RPC_URL.replace(/^http/, 'ws');
-  return 'wss://mainnet.helius-rpc.com';
-}
-let wsInstance = null;
-function connectWS() {
-  const wsUrl = getWsUrl();
-  if (!wsUrl) { errLog('Missing WS URL'); return; }
-  log('Connecting WebSocket', wsUrl);
-  wsInstance = new WebSocket(wsUrl, { handshakeTimeout: 20000 });
-  wsInstance.on('open', () => {
-    log('WS connected');
-    try {
-      if (USE_LOGS_MENTIONS && PROGRAM_IDS.length) {
-        let subId = 2000;
-        for (const pid of PROGRAM_IDS) {
-          if (!isBase58OrSystem(pid)) continue;
-          wsInstance.send(JSON.stringify({ jsonrpc: '2.0', id: subId++, method: 'logsSubscribe', params: [{ mentions: [pid] }, { commitment: WS_COMMITMENT }] }));
-        }
-      } else if (USE_PROGRAM_SUBSCRIBE && PROGRAM_IDS.length) {
-        let subId = 3000;
-        for (const pid of PROGRAM_IDS) {
-          if (!isBase58OrSystem(pid)) continue;
-          wsInstance.send(JSON.stringify({ jsonrpc: '2.0', id: subId++, method: 'programSubscribe', params: [pid, { commitment: WS_COMMITMENT }] }));
-        }
-      } else if (USE_LOGS_ALL) {
-        wsInstance.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'logsSubscribe', params: ['all', { commitment: WS_COMMITMENT }] }));
-      } else {
-        // Smart default: programSubscribe if programs defined, else logsSubscribe all
-        if (PROGRAM_IDS.length) {
-          let subId = 4000;
-          for (const pid of PROGRAM_IDS) {
-            if (!isBase58OrSystem(pid)) continue;
-            wsInstance.send(JSON.stringify({ jsonrpc: '2.0', id: subId++, method: 'programSubscribe', params: [pid, { commitment: WS_COMMITMENT }] }));
+    const bt = tx.blockTime || tx.meta?.blockTime || 0;
+    if (String(process.env.ONLY_TODAY || "true").toLowerCase() === "true") {
+      const today = isTodayFromBlockTime(bt);
+      if (today === false) return;  // Skip events not from today
+    }
+
+    if (!tx.slot) {
+      // Ensure slot is populated (fetch if missing)
+      const slot = await scheduleHttp(async () => {
+        try {
+          return await httpConn.getSlot({ commitment: "confirmed" });
+        } catch (e) {
+          const msg = String(e?.message || e).toLowerCase();
+          if (msg.includes("429") || msg.includes("too many requests")) {
+            on429();
+            rotateHttpConn();
           }
-        } else {
-          wsInstance.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'logsSubscribe', params: ['all', { commitment: WS_COMMITMENT }] }));
+          await throttleOnResult(e);
+          throw e;
+        }
+      });
+      tx.slot = slot;
+    }
+    tx.blockTime = bt;
+
+    const event = classifyLiquidity(tx);
+    if (!event) return;
+
+    // Fix signature if missing
+    if (!event.signature || event.signature === "unknown") {
+      event.signature = signature;
+    }
+
+    // =============== VALIDATE MINTS (ensure no program IDs as mints) ===============
+    if (!bothMintsValid(event)) {
+      log.debug({
+        sig: event.signature,
+        base_mint: event?.mints?.base || null,
+        quote_mint: event?.mints?.quote || null
+      }, "skip: could not infer valid token mint(s)");
+      return;
+    }
+    // ==============================================================================
+
+    // =================== DEDUPLICATION GATE ===================
+    if (dedup.shouldSkip(event)) {
+      log.debug({ sig: event.signature, scope: DEDUP_SCOPE }, "dedup: skipped duplicate");
+      return;
+    }
+    dedup.markSent(event);
+    // ==========================================================
+
+    const maxAge = envInt("MAX_AGE_SECONDS", 0);
+    if (maxAge > 0 && event.timestamp > 0) {
+      const age = Math.floor(Date.now() / 1000) - event.timestamp;
+      if (age > maxAge) return;  // too old, skip
+    }
+
+    // Only proceed if token was minted today (base or quote token)
+    const onlyToday = String(process.env.ONLY_TODAY || "true").toLowerCase() === "true";
+    if (onlyToday) {
+      const doLookup = String(process.env.ONLY_TODAY_LOOKUP || "true").toLowerCase() === "true";
+      if (doLookup) {
+        const baseMintAddr = event.mints?.base;
+        const quoteMintAddr = event.mints?.quote;
+        let baseNew = true, quoteNew = true;
+        if (baseMintAddr) {
+          baseNew = await mintedToday(httpConn, new PublicKey(baseMintAddr));
+        }
+        if (quoteMintAddr) {
+          quoteNew = await mintedToday(httpConn, new PublicKey(quoteMintAddr));
+        }
+        if (!baseNew && !quoteNew) {
+          // Neither token was created today – ignore this event
+          return;
         }
       }
-    } catch (e) {
-      errLog('Subscription error', e?.message || e);
     }
-  });
-  wsInstance.on('message', async raw => {
-    try {
-      const s = raw.toString();
-      let data;
-      try { data = JSON.parse(s); } catch { return; }
-      if (data?.method === 'logsNotification') {
-        await processEvent(data.params.result);
-      } else if (data?.method === 'programNotification' && data.params?.result?.value) {
-        const v = data.params.result.value;
-        if (v.pubkey) {
-          inspectSignaturesForMint(v.pubkey).catch(() => {});
-        }
-      } else if (data?.params?.result) {
-        const evt = data.params.result;
-        if (evt && (evt.tokenTransfers || evt.events || evt.logs)) await processEvent(evt);
-      }
-    } catch (e) {
-      errLog('WS message error', e?.message || e);
-    }
-  });
-  wsInstance.on('close', (code, reason) => {
-    warn('WS closed; reconnecting...', code, reason && reason.toString());
-    setTimeout(connectWS, 3000);
-  });
-  wsInstance.on('error', err => {
-    errLog('WS error', err?.message || err);
-  });
-}
 
-/* =====================================
- * Dashboard server
- * ===================================*/
-function startDashboard() {
-  const app = express();
-  app.set('view engine', 'ejs');
-  // Determine views directory
-  const viewsDir = fs.existsSync(path.join(__dirname, 'views')) ? path.join(__dirname, 'views') : __dirname;
-  app.set('views', viewsDir);
-  app.get('/', async (req, res) => {
+    // Log event to SQLite (persistent storage)
     try {
-      const db = await dbPromise;
-      const tokens = await db.all('SELECT * FROM tokens ORDER BY first_seen DESC LIMIT 500');
-      res.render('index', { tokens });
+      logEvent(event);
     } catch (e) {
-      res.status(500).send('DB error: ' + (e?.message || e));
+      log.error({ err: String(e) }, "DB logging failed");
     }
-  });
-  // Try binding to configured port; if busy, increment
-  const preferred = PORT;
-  const maxTries = 3;
-  (function tryPort(p, left) {
-    const server = app.listen(p, () => {
-      log(`Dashboard running at http://localhost:${p}`);
-    });
-    server.on('error', err => {
-      if (err && err.code === 'EADDRINUSE' && left > 0) {
-        warn(`Port ${p} in use — trying ${p + 1}`);
-        tryPort(p + 1, left - 1);
-      } else {
-        errLog('Express listen error', err?.message || err);
-      }
-    });
-  })(preferred, maxTries);
-}
 
-/* =====================================
- * Main entry
- * ===================================*/
-if (require.main === module) {
-  // Start services
-  connectWS();
-  startDashboard();
-  // Periodically poll Solscan chain info (optional) to warm API and log chain state
-  if (SOLSCAN_API_KEY) {
-    setInterval(async () => {
-      const info = await solscanGetChainInfo();
-      if (info && info.data) {
-        debugLog('Solscan chain height', info.data.height);
-      }
-    }, 60000);
+    // Send Telegram alert
+    await notify(event);
+    log.info({ sig: event.signature, dex: event.dex }, "alert sent");
+  } catch (e) {
+    log.error({ err: String(e), sig: signature }, "processTx error");
   }
 }
 
+// =========================
+// Subscription helper (based on mode)
+// =========================
+async function subscribeByMode(prov, pids) {
+  const SIDE = ["1", "true", "on", "yes"].includes(String(process.env.PROGRAM_SUBSCRIBE_SIDEC || "false").toLowerCase());
+
+  if (SUB_MODE === "logs_all") {
+    await onLogsAllWs(prov.connection, async ({ logs }) => {
+      const sig = logs?.signature;
+      const matches = logsContainAnyPid(logs?.logs || []);
+      if (matches && sig) await handleSignature(prov.connection, sig);
+    }, prov.label);
+    return;
+  }
+
+  if (SUB_MODE === "program_subscribe") {
+    for (const pid of pids) {
+      if (SIDE) {
+        await onProgramAccountsWs(prov.connection, pid, async ({ info, ctx, programId }) => {
+          log.debug({ programId, slot: ctx?.slot }, "program account change");
+        }, prov.label);
+      }
+      await prov.onProgramLogs(pid, async ({ logs }) => {
+        const sig = logs?.signature;
+        if (sig) await handleSignature(prov.connection, sig);
+      });
+      await sleep(PLAN === "free" ? 200 : 50);
+    }
+    return;
+  }
+
+  // default: program_logs (subscribe to onProgramLogs for each PID)
+  for (const pid of pids) {
+    await prov.onProgramLogs(pid, async ({ logs }) => {
+      const sig = logs?.signature;
+      if (sig) await handleSignature(prov.connection, sig);
+    });
+    await sleep(PLAN === "free" ? 200 : 50);
+  }
+}
+
+// =========================
+// Main (multi-provider entry point)
+// =========================
+async function main() {
+  const { meteora, extra } = loadDexPrograms();
+  const providers = providersFactory();
+
+  // Build base PID list from built-in parsers + extras
+  const basePids = new Set();
+  if (meteora?.programId) basePids.add(meteora.programId);
+  if (ORCA_WHIRLPOOLS?.programId) basePids.add(ORCA_WHIRLPOOLS.programId);
+  if (KAMINO_YVAULTS?.programId) basePids.add(KAMINO_YVAULTS.programId);
+  for (const dex of extra) {
+    for (const pid of dex.programIds || []) basePids.add(pid);
+  }
+
+  let pidsTarget = [];
+  if (PROGRAM_LOGS_MODE === "only") {
+    pidsTarget = [...new Set(PROGRAM_LOGS_LIST)];
+  } else if (PROGRAM_LOGS_MODE === "first") {
+    pidsTarget = [...new Set([...PROGRAM_LOGS_LIST, ...basePids])];
+  } else { // off
+    pidsTarget = [...basePids];
+  }
+
+  // Cap PIDs per plan / PID_CAP
+  const pidCap = envInt("PID_CAP");
+  const pids = pidsTarget.slice(0, pidCap);
+
+  // Update global sets for mint-vs-programID validation
+  __ALL_PROGRAM_IDS_SET = new Set([...__ALL_PROGRAM_IDS_SET, ...pids.map(String)]);
+  setTargetPids(pids);
+
+  // Subscribe according to SUB_MODE
+  for (const prov of providers) {
+    global.__CONNECTION__ = prov.connection;
+    await subscribeByMode(prov, pids);
+  }
+
+  log.info({
+    providers: providers.map(p => p.label),
+    plan: PLAN,
+    pids,
+    rate_rps: RATE_RPS,
+    tick_ms: TICK_MS
+  }, "subscriptions active (multi-provider)");
+}
+
+main().catch(e => {
+  console.error(e);
+  process.exit(1);
+});

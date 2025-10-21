@@ -1,15 +1,26 @@
-FROM node:20-alpine
+# Use a Node.js 20 base image (slim variant for smaller size)
+FROM node:20-slim
 
+# Set working directory
 WORKDIR /app
 
-# small tools for debugging if you exec into the container
-RUN apk add --no-cache bash curl
-
+# Install build tools for compiling better-sqlite3, then install dependencies, then remove tools
 COPY package*.json ./
-RUN npm install --production
+RUN apt-get update && \
+    apt-get install -y python3 build-essential && \ 
+    npm ci --omit=dev && \ 
+    apt-get remove -y build-essential python3 && \
+    apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/*
 
-# copy source
-COPY . .
+# Copy the application source code
+COPY . ./
 
-EXPOSE 3000
+# Create directory for persistent data (SQLite DB, dedup cache)
+RUN mkdir -p /app/data
+
+# Expose the webhook port (if using Helius/QuickNode webhooks)
+EXPOSE 8080
+
+# Launch the watcher
 CMD ["node", "node-app.js"]

@@ -1,12 +1,91 @@
-version: "3.9"
+version: "3.8"
+
 services:
-  solana-bot:
+  watcher:
     build: .
-    container_name: helius-wesocket-solana-bot
+    container_name: solana-liquidity-watcher
     restart: unless-stopped
-    env_file: .env
-    volumes:
-      - .:/app                    # bind mount for local dev; remove if you want immutable image
-      - ./tokens.db:/app/tokens.db
+
+    # 1) Forma recomendada: carregar variáveis do .env
+    # (o Compose já lê .env para substituição; aqui garantimos também via env_file)
+    env_file:
+      - .env
+
+    # 2) Variáveis “fixas”/novas ou overrides importantes
+    #    (você pode manter TODAS as que já tinha aqui também, apontando para ${...} do .env)
+    environment:
+      # --- Providers / Endpoints / Modes (mantidos do seu compose atual) ---
+      - PROVIDER_MODE=${PROVIDER_MODE}
+      - PROVIDER_MODES=${PROVIDER_MODES}
+      - SUB_MODE=${SUB_MODE}
+      - PROGRAM_LOGS_MODE=${PROGRAM_LOGS_MODE}
+      - PID_CAP=${PID_CAP}
+      - RPC_HTTP_URL=${RPC_HTTP_URL}
+      - RPC_ALT_URLS=${RPC_ALT_URLS}
+      - RPC_WS_URL=${RPC_WS_URL}
+      - HELIUS_ENHANCED_WS_URL=${HELIUS_ENHANCED_WS_URL}
+      - HELIUS_API_KEY=${HELIUS_API_KEY}
+      - QUICKNODE_WS_URL=${QUICKNODE_WS_URL}
+
+      # --- Webhook / Commitments / Concurrency / Throttle (mantidos) ---
+      - WEBHOOK_PORT=${WEBHOOK_PORT}
+      - WEBHOOK_HELIUS_PATH=${WEBHOOK_HELIUS_PATH}
+      - WEBHOOK_QN_PATH=${WEBHOOK_QN_PATH}
+      - WEBHOOK_SHARED_SECRET=${WEBHOOK_SHARED_SECRET}
+      - WEBHOOK_SECRET_HEADER=${WEBHOOK_SECRET_HEADER}
+      - COMMITMENT=${COMMITMENT}
+      - WS_COMMITMENT=${WS_COMMITMENT}
+      - RPC_COMMITMENT=${RPC_COMMITMENT}
+      - CONCURRENCY=${CONCURRENCY}
+      - RATE_LIMIT_RPS=${RATE_LIMIT_RPS}
+      - RATE_LIMIT_REFILL_MS=${RATE_LIMIT_REFILL_MS}
+      - AFTER_HTTP_MS=${AFTER_HTTP_MS}
+      - CIRCUIT_429_THRESHOLD=${CIRCUIT_429_THRESHOLD}
+      - CIRCUIT_OPEN_MS=${CIRCUIT_OPEN_MS}
+      - RESERVOIR_MAX=${RESERVOIR_MAX}
+      - RPC_TIMEOUT_MS=${RPC_TIMEOUT_MS}
+      - MAX_FETCH_SIGNATURES=${MAX_FETCH_SIGNATURES}
+
+      # --- Filtros “token criado hoje” / idade / genéricos (mantidos) ---
+      - ONLY_TODAY=${ONLY_TODAY}
+      - ONLY_TODAY_LOOKUP=${ONLY_TODAY_LOOKUP}
+      - MAX_AGE_SECONDS=${MAX_AGE_SECONDS}
+      - GENERIC_REQUIRE_MARKER=${GENERIC_REQUIRE_MARKER}
+
+      # --- Telegram (mantidos) ---
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+
+      # --- Dedup (mantidos) ---
+      - DEDUP_ENABLED=${DEDUP_ENABLED}
+      - DEDUP_SCOPE=${DEDUP_SCOPE}
+      - DEDUP_TTL_SECONDS=${DEDUP_TTL_SECONDS}
+
+      # --- Labels/extra se você usa na UI ---
+      - KNOWN_MINT_LABELS=${KNOWN_MINT_LABELS}
+
+      # --- SQLite (NOVO) ---
+      # Grava o banco e o cache no volume /app/data (persistente)
+      - DB_FILE=/app/data/liquidity.db
+      - DEDUP_FILE=/app/data/dedup-cache.json
+
+      # Tuning opcional (com defaults seguros)
+      - DB_SYNCHRONOUS=${DB_SYNCHRONOUS:-NORMAL}
+      - DB_WAL_AUTOCHECKPOINT=${DB_WAL_AUTOCHECKPOINT:-1000}
+      - DB_BATCH_SIZE=${DB_BATCH_SIZE:-200}
+      - DB_MAX_DELAY_MS=${DB_MAX_DELAY_MS:-250}
+      - DB_CACHE_PAGES=${DB_CACHE_PAGES:-20000}
+      - DB_MMAP_MB=${DB_MMAP_MB:-1024}
+      - DB_BUSY_TIMEOUT=${DB_BUSY_TIMEOUT:-5000}
+
+    # Exponha o webhook (fallback para 8080 se WEBHOOK_PORT não estiver definido)
     ports:
-      - "3000:3000"
+      - "${WEBHOOK_PORT:-8080}:${WEBHOOK_PORT:-8080}"
+
+    volumes:
+      # Persistência: SQLite + dedup dentro de /app/data
+      - ./data:/app/data
+      # Config dos programas (programs.json lido em runtime)
+      - ./programs.json:/app/programs.json:ro
+      # DICA: NÃO é necessário montar o .env como volume; o Compose já injeta via env_file/.env
+      # - ./.env:/app/.env:ro
