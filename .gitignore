@@ -3,3 +3,6 @@
 *.db-wal
 *.db-shm
 "@ | Out-File -Encoding utf8 -Append .gitignore
+*.db
+*.db-wal
+*.db-shm
