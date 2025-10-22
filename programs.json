@@ -1,10 +1,33 @@
 {
   "meteora": {
-    "label": "Meteora CP-AMM",
-    "programId": "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG",
-    "markers": [
+    "label": "Meteora CP-AMM/DBC",
+    "programId": ["cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG",
+    "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN"],
+    "markers":
+    
+    [
       "InitializePool",
-      "CreatePosition"
+      "add liquidity",
+        "addliquidity",
+        "openposition",
+        "increaseliquidity",
+        "initialize pool",
+        "createpool",
+        "create_pool",
+        "open_position_v2",
+        "open_position",
+        "initialize",
+        "Create pool",
+        "migrate_to_cpswap",
+        "initialize2",
+        "add_liquidity",
+        "initialize_pool",
+        "initialize_pool_with_dynamic_config",
+        "create_position",
+        "initialize_virtual_pool_with_spl_token",
+        "Create",
+        "Migration_damm_v2"
+        
     ]
   },
   "defaultMarkers": [
@@ -14,7 +37,21 @@
     "deposit",
     "create",
     "initializepool",
-    "createpool"
+    "createpool",
+     "addliquidity",
+        "openposition",
+        "increaseliquidity",
+        "initializepool",
+        "createpool",
+        "create_pool",
+        "open_position_v2",
+        "open_position",
+        "initialize",
+        "createAccountWithSeed",
+        "Create pool",
+        "migrate_to_cpswap",
+        "initialize2",
+        "initialize_v2"
   ],
   "programLogs": [
     "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
@@ -39,7 +76,9 @@
     "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s",
     "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",
     "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ",
-    "11111111111111111111111111111111"
+    "11111111111111111111111111111111",
+    "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj"
+    
   ],
   "dexes": [
     {
@@ -48,6 +87,7 @@
         "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
       ],
       "liquidityMarkers": [
+        "addliquidity",
         "InitializePositionAndAddLiquidity",
         "AddLiquidity",
         "AddLiquidityByStrategy",
@@ -58,7 +98,9 @@
         "add_liquidity_by_strategy_one_side",
         "add_liquidity_by_weight",
         "add_liquidity_one_side",
-        "add_liquidity_one_side_precise2"
+        "add_liquidity_one_side_precise2",
+        "initialize_lb_pair2",
+        "Create pool"
       ]
     },
     {
@@ -72,7 +114,20 @@
         "add_liquidity",
         "initialize_pool",
         "initialize_pool_with_dynamic_config",
-        "initialize_customizable_pool"
+        "initialize_customizable_pool",
+         "addliquidity",
+        "openposition",
+        "increaseliquidity",
+        "initializepool",
+        "createpool",
+        "create_pool",
+        "open_position_v2",
+        "open_position",
+        "initialize",
+        "createAccountWithSeed",
+        "Create pool",
+        "migrate_to_cpswap",
+        "initialize2"
         
       ]
     },
@@ -82,7 +137,8 @@
         "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
         "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C",
         "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
-        "5quBtoiQqxF9Jv6KYKctB59NT3gtJD2Y65kdnB1Uev3h"
+        "5quBtoiQqxF9Jv6KYKctB59NT3gtJD2Y65kdnB1Uev3h",
+        "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj"
       ],
       "liquidityMarkers": [
        "add liquidity",
@@ -96,10 +152,13 @@
         "open_position",
         "initialize",
         "createAccountWithSeed",
-        "Create pool",
-        "migrate_to_cpswap",
-        "initialize2",
-        "raydium:add-liquidity"
+        "Initialize2",
+        "raydium:add-liquidity",
+        "Create_pool",
+        "openLiquidityPosition",
+        "createAccountWithSeed",
+        "initialize_v2",
+        "Add"
       ]
     },
     {
@@ -113,10 +172,11 @@
         "increaseLiquidity",
         "decreaseLiquidity",
         "openPosition",
-        "initializePoolV2",
         "initializeTickArray",
         "openPosition",
-        "openPositionWithMetadata"
+        "openPositionWithMetadata",
+        "initializePoolV2",
+        "Create"
     
       ]
     },
@@ -125,7 +185,20 @@
       "programIds": [
         "6LtLpnUFNByNXLyCoK9wA2MykKAmQNZKBdY8s47dehDc"
       ],
-      "liquidityMarkers": [
+      "liquidityMarkers": [ 
+        "addliquidity",
+        "openposition",
+        "increaseliquidity",
+        "initializepool",
+        "createpool",
+        "create_pool",
+        "open_position_v2",
+        "open_position",
+        "initialize",
+        "createAccountWithSeed",
+        "Create pool",
+        "migrate_to_cpswap",
+        "initialize2",
         "Invest"
       ]
     },
@@ -134,7 +207,19 @@
       "programIds": [
         "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"
       ],
-      "liquidityMarkers": []
+      "liquidityMarkers": [ "addliquidity",
+        "openposition",
+        "increaseliquidity",
+        "initializepool",
+        "createpool",
+        "create_pool",
+        "open_position_v2",
+        "open_position",
+        "initialize",
+        "createAccountWithSeed",
+        "Create pool",
+        "migrate_to_cpswap",
+        "initialize2"]
     },
     {
       "name": "Pump AMM",
@@ -143,8 +228,22 @@
         "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
       ],
       "liquidityMarkers": [
-        "Create",
-        "create_pool"
+        "addliquidity",
+        "openposition",
+        "increaseliquidity",
+        "initializepool",
+        "createpool",
+        "create_pool",
+        "open_position_v2",
+        "open_position",
+        "initialize",
+        "createAccountWithSeed",
+        "Create pool",
+        "migrate_to_cpswap",
+        "initialize2",
+        "create",
+        "create_pool",
+        "extend_account"
         
       ]
     },
@@ -164,7 +263,20 @@
         "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ",
         "11111111111111111111111111111111"
       ],
-      "liquidityMarkers": []
+      "liquidityMarkers": [
+         "addliquidity",
+        "openposition",
+        "increaseliquidity",
+        "initializepool",
+        "createpool",
+        "create_pool",
+        "open_position_v2",
+        "open_position",
+        "initialize",
+        "createAccountWithSeed",
+        "Create pool",
+        "migrate_to_cpswap",
+        "initialize2"]
     }
   ]
 }
