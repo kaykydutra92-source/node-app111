@@ -126,8 +126,7 @@ function isValidMint(mintStr) {
 // DEDUP START — send only once per token (configurable scope)
 // ======================================================================
 const DEDUP_ENABLED = ["1", "true", "yes", "on"].includes(String(process.env.DEDUP_ENABLED ?? "true").toLowerCase());
-const DEDUP_SCOPE = String(process.env.DEDUP_SCOPE || "mint_day").toLowerCase();
-  // options: mint | mint_day | mint_pool_day | mint_forever
+const DEDUP_SCOPE = String(process.env.DEDUP_SCOPE || "mint_day").toLowerCase();  // options: mint | mint_day | mint_pool_day | mint_forever
 const DEDUP_TTL_SECONDS = parseInt(process.env.DEDUP_TTL_SECONDS || "86400", 10);
 const DEDUP_FILE = process.env.DEDUP_FILE
   ? path.resolve(process.cwd(), process.env.DEDUP_FILE)
@@ -197,7 +196,7 @@ class Dedup {
         const arr = JSON.parse(fs.readFileSync(DEDUP_FILE, "utf8"));
         if (Array.isArray(arr)) {
           for (const [k, v] of arr) this.map.set(k, v);
-        }
+          }
       }
     } catch (e) {
       console.warn("[dedup] load error, starting empty:", e?.message || e);
@@ -213,10 +212,7 @@ class Dedup {
       console.warn("[dedup] save error:", e?.message || e);
     }
   }
-    _startPruner() {
-    // Mantém o processo vivo: NÃO usar .unref() aqui.
-    // Assim, mesmo sem WS/webhook ativo, este timer referenciado
-    // impede que o Node finalize imediatamente.
+  _startPruner() {
     setInterval(() => {
       const now = (Date.now() / 1000) | 0;
       let removed = 0;
@@ -227,34 +223,13 @@ class Dedup {
         }
       }
       if (removed > 0) this._save();
-    }, 10 * 60 * 1000);
+    }, 10 * 60 * 1000).unref();
   }
-
 }
-
-
-// Depois desta linha existente:
 const dedup = new Dedup();
-
-// ADICIONE isto logo abaixo:
-if (["1","true","on","yes"].includes(String(process.env.KEEPALIVE_FORCE ?? "true").toLowerCase())) {
-  // Keep-alive baratinho: impede o Node de sair quando o app está “ocioso”.
-  setInterval(() => {}, 30 * 1000);
-}
-
 // ======================================================================
 // DEDUP END
 // ======================================================================
-
-// =========================
-// Multi-Factor Liquidity Detection toggles
-// =========================
-const MF_ENABLED = envBool("MULTIFACTOR_ENABLED", false);
-const MF_REQUIRE_TWO_VAULTS = envBool("MF_REQUIRE_TWO_VAULTS", false);
-const MF_REQUIRE_LP_MINT = envBool("MF_REQUIRE_LP_MINT", false);
-const MF_REQUIRE_FIRST_HISTORY = envBool("MF_REQUIRE_FIRST_HISTORY", false);
-const MF_MAX_RATIO = envInt("MF_MAX_RATIO", 0);
-const MF_CHECK_PROVIDER_IS_MINT_AUTH = envBool("MF_CHECK_PROVIDER_IS_MINT_AUTH", false);
 
 // =========================
 // Telegram notify
@@ -395,8 +370,58 @@ function rotateHttpConn() {
 }
 
 // =========================
-// Webhook (Helius/QuickNode Streams)
+// Providers (WS / Webhook) — multiple modes
 // =========================
+function providerLabel(mode) { return mode; }
+function makeWsConnection(wsUrl, httpUrl) {
+  const commitment = process.env.COMMITMENT || "confirmed";
+  return new Connection(httpUrl || PRIMARY_HTTP, { commitment, wsEndpoint: wsUrl });
+}
+async function onProgramLogsWs(conn, programId, callback, label = "ws") {
+  const id = await conn.onLogs(
+    new PublicKey(programId),
+    async (logs, ctx) => {
+      try {
+        await callback({ logs, ctx });
+      } catch (e) {
+        console.error(`[onLogs cb ${label}]`, e);
+      }
+    },
+    process.env.WS_COMMITMENT || "processed"
+  );
+  return id;
+}
+async function onLogsAllWs(conn, callback, label = "logs_all") {
+  const id = await conn.onLogs(
+    "all",
+    async (logs, ctx) => {
+      try {
+        await callback({ logs, ctx });
+      } catch (e) {
+        console.error(`[onLogs all ${label}]`, e);
+      }
+    },
+    process.env.WS_COMMITMENT || "processed"
+  );
+  return id;
+}
+async function onProgramAccountsWs(conn, programId, callback, label = "program_subscribe") {
+  // Note: this callback does NOT provide a signature; used only for side metrics
+  const id = await conn.onProgramAccountChange(
+    new PublicKey(programId),
+    async (info, ctx) => {
+      try {
+        await callback({ info, ctx, programId });
+      } catch (e) {
+        console.error(`[onProgramAccount ${label}]`, e);
+      }
+    },
+    process.env.WS_COMMITMENT || "processed"
+  );
+  return id;
+}
+
+// Webhook (Helius/QuickNode Streams)
 function startWebhookAt(path, onTxLike) {
   const app = startWebhookAt.__app || express();
   startWebhookAt.__app = app;
@@ -421,6 +446,7 @@ function startWebhookAt(path, onTxLike) {
       }
       const body = req.body;
       const txs = Array.isArray(body) ? body : (body?.transactions || body?.data || [body]);
+      console.log(`[webhook] received ${txs.length} transactions on path ${path}`);
       for (const tx of txs) {
         // Gate by target PIDs (avoid noise)
         if (!txLikeTouchesAnyPid(tx)) continue;
@@ -452,16 +478,9 @@ function providersFactory() {
     .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
 
   const list = [];
-  let configError = false;
-
   for (const mode of modes) {
     if (mode === "solana_ws") {
-      const wsUrl = process.env.RPC_WS_URL;
-      if (!wsUrl) {
-        log.error({ mode }, "FATAL: solana_ws requer RPC_WS_URL (endpoint WebSocket). Defina no .env.");
-        configError = true;
-        continue;
-      }
+      const wsUrl = process.env.RPC_WS_URL || undefined;
       const conn = makeWsConnection(wsUrl, PRIMARY_HTTP);
       list.push({
         mode,
@@ -472,12 +491,10 @@ function providersFactory() {
       });
       continue;
     }
-
     if (mode === "helius_ws") {
       const wsUrl = process.env.HELIUS_ENHANCED_WS_URL;
       if (!wsUrl) {
-        log.error({ mode }, "FATAL: helius_ws requer HELIUS_ENHANCED_WS_URL (endpoint Enhanced WS da Helius).");
-        configError = true;
+        log.warn({ mode }, "helius_ws requires HELIUS_ENHANCED_WS_URL");
         continue;
       }
       const conn = makeWsConnection(wsUrl, PRIMARY_HTTP);
@@ -490,12 +507,10 @@ function providersFactory() {
       });
       continue;
     }
-
     if (mode === "quicknode_ws") {
       const wsUrl = process.env.QUICKNODE_WS_URL;
       if (!wsUrl) {
-        log.error({ mode }, "FATAL: quicknode_ws requer QUICKNODE_WS_URL (endpoint WS do QuickNode).");
-        configError = true;
+        log.warn({ mode }, "quicknode_ws requires QUICKNODE_WS_URL");
         continue;
       }
       const conn = makeWsConnection(wsUrl, PRIMARY_HTTP);
@@ -508,12 +523,9 @@ function providersFactory() {
       });
       continue;
     }
-
     if (mode === "webhook_helius") {
       const path = process.env.WEBHOOK_HELIUS_PATH || "/streams/helius";
       startWebhookAt(path, () => {});
-      const altPath = process.env.WEBHOOK_ALT_PATH || "/streams/webhook";
-      if (altPath) startWebhookAt(altPath, () => {});
       const conn = makeConnection();
       list.push({
         mode,
@@ -524,7 +536,6 @@ function providersFactory() {
       });
       continue;
     }
-
     if (mode === "webhook_quicknode") {
       const path = process.env.WEBHOOK_QN_PATH || "/streams/qn";
       startWebhookAt(path, () => {});
@@ -538,19 +549,9 @@ function providersFactory() {
       });
       continue;
     }
-
-    log.warn({ mode }, "provider mode não reconhecido — ignorando");
+    log.warn({ mode }, "provider mode not recognized — ignoring");
   }
 
-  // Se o usuário escolheu apenas modos WS mas esqueceu o endpoint, abortamos cedo:
-  if (list.length === 0 && configError) {
-    // Mantém processo vivo para evidenciar o erro no console (e evitar “silêncio”),
-    // mas falha explicitamente.
-    setInterval(() => {}, 60 * 1000);
-    throw new Error("Configuração inválida: modo WS escolhido sem URL WS correspondente no .env");
-  }
-
-  // Fallback antigo (somente se NÃO houve erro de config e nada foi adicionado):
   if (list.length === 0) {
     const conn = makeConnection();
     list.push({
@@ -560,9 +561,7 @@ function providersFactory() {
       onProgramLogs: (pid, cb) => onProgramLogsWs(conn, pid, cb, "solana_ws"),
       type: "ws"
     });
-    log.warn("Nenhum provider declarado — usando fallback solana_ws (verifique RPC_WS_URL para WS real).");
   }
-
   return list;
 }
 
@@ -778,7 +777,9 @@ const KAMINO_YVAULTS = {
   markers: ["Invest"]
 };
 const METEORA_DLMM_PID = METEORA_DLMM.programId;
-function _hasAny(logs, needles) { return (logs || []).some(l => needles.some(n => l.includes(n))); }
+function _hasAny(logs, needles) {
+  return (logs || []).some(l => needles.some(n => l.includes(n)));
+}
 function looksLikeKaminoInvest(tx) {
   const logs = tx?.meta?.logMessages || [];
   const keys = tx?.transaction?.message?.accountKeys || [];
@@ -1062,7 +1063,10 @@ async function fetchAndProcessTx(_connForWs, signature) {
     const bt = tx.blockTime || tx.meta?.blockTime || 0;
     if (String(process.env.ONLY_TODAY || "true").toLowerCase() === "true") {
       const today = isTodayFromBlockTime(bt);
-      if (today === false) return;  // Skip events not from today
+      if (today === false) {
+        log.info({ sig: signature, slot: tx.slot, blockTime: bt }, "skip: transaction not from today");
+        return;
+      }
     }
 
     if (!tx.slot) {
@@ -1085,7 +1089,10 @@ async function fetchAndProcessTx(_connForWs, signature) {
     tx.blockTime = bt;
 
     const event = classifyLiquidity(tx);
-    if (!event) return;
+    if (!event) {
+      log.info({ sig: signature }, "skip: no known liquidity event for this transaction");
+      return;
+    }
 
     // Fix signature if missing
     if (!event.signature || event.signature === "unknown") {
@@ -1094,7 +1101,7 @@ async function fetchAndProcessTx(_connForWs, signature) {
 
     // =============== VALIDATE MINTS (ensure no program IDs as mints) ===============
     if (!bothMintsValid(event)) {
-      log.debug({
+      log.info({
         sig: event.signature,
         base_mint: event?.mints?.base || null,
         quote_mint: event?.mints?.quote || null
@@ -1103,124 +1110,9 @@ async function fetchAndProcessTx(_connForWs, signature) {
     }
     // ==============================================================================
 
-    // =================== MULTI-FACTOR LIQUIDITY CHECKS ===================
-    if (MF_ENABLED) {
-      // Require two vaults (base and quote deposits)
-      if (MF_REQUIRE_TWO_VAULTS && event.single_sided === true) {
-        log.debug({ sig: event.signature }, "skip: liquidity event is single-sided");
-        return;
-      }
-      // Identify LP token mint from user inflows if needed
-      let lpMint = null;
-      if (MF_REQUIRE_LP_MINT || MF_REQUIRE_FIRST_HISTORY || MF_CHECK_PROVIDER_IS_MINT_AUTH) {
-        const { byOwner } = computeTokenDeltas(tx.meta);
-        const userList = byOwner.get(event.user_wallet) || [];
-        for (const rec of userList) {
-          if (rec.delta > 0 && rec.mint !== event.mints.base && rec.mint !== event.mints.quote && isValidMint(rec.mint)) {
-            lpMint = rec.mint;
-            break;
-          }
-        }
-      }
-      // Require LP token minted to provider
-      if (MF_REQUIRE_LP_MINT && !lpMint) {
-        log.debug({ sig: event.signature }, "skip: no LP token minted to provider");
-        return;
-      }
-      // Require first-time account usage (no prior transactions for pool and LP mint)
-      if (MF_REQUIRE_FIRST_HISTORY) {
-        if (event.pool_authority) {
-          try {
-            const history = await scheduleHttp(async () => {
-              try {
-                return await httpConn.getSignaturesForAddress(new PublicKey(event.pool_authority), { limit: 1, before: event.signature, commitment: "confirmed" });
-              } catch (e) {
-                const msg = String(e?.message || e).toLowerCase();
-                if (msg.includes("429") || msg.includes("too many requests")) {
-                  on429();
-                  rotateHttpConn();
-                }
-                await throttleOnResult(e);
-                throw e;
-              }
-            });
-            if (history.length > 0) {
-              log.debug({ sig: event.signature, pool: event.pool_authority }, "skip: pool account has prior transactions");
-              return;
-            }
-          } catch (e) {
-            console.warn("[multi-factor] pool history check failed, continuing:", e);
-          }
-        }
-        if (lpMint) {
-          try {
-            const history = await scheduleHttp(async () => {
-              try {
-                return await httpConn.getSignaturesForAddress(new PublicKey(lpMint), { limit: 1, before: event.signature, commitment: "confirmed" });
-              } catch (e) {
-                const msg = String(e?.message || e).toLowerCase();
-                if (msg.includes("429") || msg.includes("too many requests")) {
-                  on429();
-                  rotateHttpConn();
-                }
-                await throttleOnResult(e);
-                throw e;
-              }
-            });
-            if (history.length > 0) {
-              log.debug({ sig: event.signature, lp_mint: lpMint }, "skip: LP token mint has prior transactions");
-              return;
-            }
-          } catch (e) {
-            console.warn("[multi-factor] LP mint history check failed, continuing:", e);
-          }
-        }
-      }
-      // Sanity check: deposit ratio limits
-      if (MF_MAX_RATIO > 0) {
-        const bAmt = event.amounts?.base_in ?? 0;
-        const qAmt = event.amounts?.quote_in ?? 0;
-        let ratio = Infinity;
-        if (bAmt > 0 && qAmt > 0) {
-          ratio = bAmt > qAmt ? (bAmt / qAmt) : (qAmt / bAmt);
-        }
-        if (ratio > MF_MAX_RATIO) {
-          log.debug({ sig: event.signature, ratio }, "skip: deposit ratio exceeds limit");
-          return;
-        }
-      }
-      // Optional: provider is mint authority check
-      if (MF_CHECK_PROVIDER_IS_MINT_AUTH && lpMint) {
-        try {
-          const mintInfo = await scheduleHttp(async () => {
-            try {
-              return await httpConn.getParsedAccountInfo(new PublicKey(lpMint));
-            } catch (e) {
-              const msg = String(e?.message || e).toLowerCase();
-              if (msg.includes("429") || msg.includes("too many requests")) {
-                on429();
-                rotateHttpConn();
-              }
-              await throttleOnResult(e);
-              throw e;
-            }
-          });
-          const mintParsed = mintInfo?.value?.data?.parsed?.info;
-          const mintAuth = mintParsed?.mintAuthority;
-          if (!mintAuth || (typeof mintAuth === "string" ? mintAuth : String(mintAuth)) !== event.user_wallet) {
-            log.debug({ sig: event.signature, provider: event.user_wallet, mint_auth: mintAuth || null }, "skip: provider is not LP mint authority");
-            return;
-          }
-        } catch (e) {
-          console.warn("[multi-factor] mint authority check failed, continuing:", e);
-        }
-      }
-    }
-    // ==========================================================
-
     // =================== DEDUPLICATION GATE ===================
     if (dedup.shouldSkip(event)) {
-      log.debug({ sig: event.signature, scope: DEDUP_SCOPE }, "dedup: skipped duplicate");
+      log.info({ sig: event.signature, scope: DEDUP_SCOPE }, "dedup: skipped duplicate");
       return;
     }
     dedup.markSent(event);
@@ -1229,7 +1121,10 @@ async function fetchAndProcessTx(_connForWs, signature) {
     const maxAge = envInt("MAX_AGE_SECONDS", 0);
     if (maxAge > 0 && event.timestamp > 0) {
       const age = Math.floor(Date.now() / 1000) - event.timestamp;
-      if (age > maxAge) return;  // too old, skip
+      if (age > maxAge) {
+        log.info({ sig: event.signature, age }, "skip: event older than max age");
+        return;
+      }
     }
 
     // Only proceed if token was minted today (base or quote token)
@@ -1247,7 +1142,7 @@ async function fetchAndProcessTx(_connForWs, signature) {
           quoteNew = await mintedToday(httpConn, new PublicKey(quoteMintAddr));
         }
         if (!baseNew && !quoteNew) {
-          // Neither token was created today – ignore this event
+          log.info({ sig: event.signature }, "skip: tokens not newly minted today");
           return;
         }
       }
@@ -1267,3 +1162,119 @@ async function fetchAndProcessTx(_connForWs, signature) {
     log.error({ err: String(e), sig: signature }, "processTx error");
   }
 }
+
+// =========================
+// Subscription helper (based on mode)
+// =========================
+async function subscribeByMode(prov, pids) {
+  const SIDE = ["1", "true", "on", "yes"].includes(String(process.env.PROGRAM_SUBSCRIBE_SIDEC || "false").toLowerCase());
+
+  if (SUB_MODE === "logs_all") {
+    const subId = await onLogsAllWs(prov.connection, async ({ logs }) => {
+      const sig = logs?.signature;
+      const matches = logsContainAnyPid(logs?.logs || []);
+      if (!matches) {
+        log.info({ signature: logs?.signature }, "skip: log event does not match target PIDs");
+        return;
+      }
+      if (!sig) {
+        log.info("skip: log event missing transaction signature");
+        return;
+      }
+      await handleSignature(prov.connection, sig);
+    }, prov.label);
+    log.info(`[ws] logs_all subscription active on ${prov.label} (ID: ${subId})`);
+    return;
+  }
+
+  if (SUB_MODE === "program_subscribe") {
+    for (const pid of pids) {
+      if (SIDE) {
+        const acctSubId = await onProgramAccountsWs(prov.connection, pid, async ({ info, ctx, programId }) => {
+          log.debug({ programId, slot: ctx?.slot }, "program account change");
+        }, prov.label);
+        log.info(`[ws] program account change subscription active for program ${pid} (ID: ${acctSubId})`);
+      }
+      const logsSubId = await prov.onProgramLogs(pid, async ({ logs }) => {
+        const sig = logs?.signature;
+        if (sig) await handleSignature(prov.connection, sig);
+      });
+      log.info(`[ws] program logs subscription active for program ${pid} on provider ${prov.label} (ID: ${logsSubId})`);
+      await sleep(PLAN === "free" ? 200 : 50);
+    }
+    return;
+  }
+
+  // default: program_logs (subscribe to onProgramLogs for each PID)
+  for (const pid of pids) {
+    const subId = await prov.onProgramLogs(pid, async ({ logs }) => {
+      const sig = logs?.signature;
+      if (sig) await handleSignature(prov.connection, sig);
+    });
+    log.info(`[ws] program logs subscription active for program ${pid} (ID: ${subId})`);
+    await sleep(PLAN === "free" ? 200 : 50);
+  }
+}
+
+// =========================
+// Main (multi-provider entry point)
+// =========================
+async function main() {
+  log.info("Loading program configurations...");
+  const { meteora, extra } = loadDexPrograms();
+  log.info(`Program config loaded: ${extra.length} extra DEX definitions loaded`);
+  log.info("Initializing provider connections...");
+  const providers = providersFactory();
+  log.info({ count: providers.length, modes: providers.map(p => p.mode) }, "Providers initialized");
+
+  // Build base PID list from built-in parsers + extras
+  log.info("Assembling target program ID list...");
+  const basePids = new Set();
+  if (meteora?.programId) basePids.add(meteora.programId);
+  if (ORCA_WHIRLPOOLS?.programId) basePids.add(ORCA_WHIRLPOOLS.programId);
+  if (KAMINO_YVAULTS?.programId) basePids.add(KAMINO_YVAULTS.programId);
+  for (const dex of extra) {
+    for (const pid of dex.programIds || []) basePids.add(pid);
+  }
+
+  let pidsTarget = [];
+  if (PROGRAM_LOGS_MODE === "only") {
+    pidsTarget = [...new Set(PROGRAM_LOGS_LIST)];
+  } else if (PROGRAM_LOGS_MODE === "first") {
+    pidsTarget = [...new Set([...PROGRAM_LOGS_LIST, ...basePids])];
+  } else { // off
+    pidsTarget = [...basePids];
+  }
+
+  // Cap PIDs per plan / PID_CAP
+  const pidCap = envInt("PID_CAP");
+  const pids = pidsTarget.slice(0, pidCap);
+
+  // Update global sets for mint-vs-programID validation
+  __ALL_PROGRAM_IDS_SET = new Set([...__ALL_PROGRAM_IDS_SET, ...pids.map(String)]);
+  setTargetPids(pids);
+  log.info({ pids: pids.map(x => String(x)) }, "Target program IDs determined");
+
+  // Subscribe according to SUB_MODE
+  log.info(`Subscribing to programs (mode: ${SUB_MODE}) for ${providers.length} provider(s)...`);
+  for (const prov of providers) {
+    global.__CONNECTION__ = prov.connection;
+    await subscribeByMode(prov, pids);
+  }
+
+  log.info({
+    providers: providers.map(p => p.label),
+    plan: PLAN,
+    pids,
+    rate_rps: RATE_RPS,
+    tick_ms: TICK_MS
+  }, "subscriptions active (multi-provider)");
+  log.info("All subscriptions are now active and event handlers attached.");
+  log.info("Startup complete. Beginning event monitoring...");
+  setInterval(() => log.info("waiting for events..."), 60000);
+}
+
+main().catch(e => {
+  console.error(e);
+  process.exit(1);
+});
