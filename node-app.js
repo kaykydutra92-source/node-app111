@@ -452,9 +452,16 @@ function providersFactory() {
     .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
 
   const list = [];
+  let configError = false;
+
   for (const mode of modes) {
     if (mode === "solana_ws") {
-      const wsUrl = process.env.RPC_WS_URL || undefined;
+      const wsUrl = process.env.RPC_WS_URL;
+      if (!wsUrl) {
+        log.error({ mode }, "FATAL: solana_ws requer RPC_WS_URL (endpoint WebSocket). Defina no .env.");
+        configError = true;
+        continue;
+      }
       const conn = makeWsConnection(wsUrl, PRIMARY_HTTP);
       list.push({
         mode,
@@ -465,10 +472,12 @@ function providersFactory() {
       });
       continue;
     }
+
     if (mode === "helius_ws") {
       const wsUrl = process.env.HELIUS_ENHANCED_WS_URL;
       if (!wsUrl) {
-        log.warn({ mode }, "helius_ws requires HELIUS_ENHANCED_WS_URL");
+        log.error({ mode }, "FATAL: helius_ws requer HELIUS_ENHANCED_WS_URL (endpoint Enhanced WS da Helius).");
+        configError = true;
         continue;
       }
       const conn = makeWsConnection(wsUrl, PRIMARY_HTTP);
@@ -481,10 +490,12 @@ function providersFactory() {
       });
       continue;
     }
+
     if (mode === "quicknode_ws") {
       const wsUrl = process.env.QUICKNODE_WS_URL;
       if (!wsUrl) {
-        log.warn({ mode }, "quicknode_ws requires QUICKNODE_WS_URL");
+        log.error({ mode }, "FATAL: quicknode_ws requer QUICKNODE_WS_URL (endpoint WS do QuickNode).");
+        configError = true;
         continue;
       }
       const conn = makeWsConnection(wsUrl, PRIMARY_HTTP);
@@ -497,13 +508,12 @@ function providersFactory() {
       });
       continue;
     }
+
     if (mode === "webhook_helius") {
       const path = process.env.WEBHOOK_HELIUS_PATH || "/streams/helius";
       startWebhookAt(path, () => {});
-      const altPath = process.env.WEBHOOK_ALT_PATH;
-      if (altPath) {
-        startWebhookAt(altPath, () => {});
-      }
+      const altPath = process.env.WEBHOOK_ALT_PATH || "/streams/webhook";
+      if (altPath) startWebhookAt(altPath, () => {});
       const conn = makeConnection();
       list.push({
         mode,
@@ -514,6 +524,7 @@ function providersFactory() {
       });
       continue;
     }
+
     if (mode === "webhook_quicknode") {
       const path = process.env.WEBHOOK_QN_PATH || "/streams/qn";
       startWebhookAt(path, () => {});
@@ -527,9 +538,19 @@ function providersFactory() {
       });
       continue;
     }
-    log.warn({ mode }, "provider mode not recognized — ignoring");
+
+    log.warn({ mode }, "provider mode não reconhecido — ignorando");
   }
 
+  // Se o usuário escolheu apenas modos WS mas esqueceu o endpoint, abortamos cedo:
+  if (list.length === 0 && configError) {
+    // Mantém processo vivo para evidenciar o erro no console (e evitar “silêncio”),
+    // mas falha explicitamente.
+    setInterval(() => {}, 60 * 1000);
+    throw new Error("Configuração inválida: modo WS escolhido sem URL WS correspondente no .env");
+  }
+
+  // Fallback antigo (somente se NÃO houve erro de config e nada foi adicionado):
   if (list.length === 0) {
     const conn = makeConnection();
     list.push({
@@ -539,7 +560,9 @@ function providersFactory() {
       onProgramLogs: (pid, cb) => onProgramLogsWs(conn, pid, cb, "solana_ws"),
       type: "ws"
     });
+    log.warn("Nenhum provider declarado — usando fallback solana_ws (verifique RPC_WS_URL para WS real).");
   }
+
   return list;
 }
 
